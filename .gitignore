@@ -1,6 +1,9 @@
 config/cluster.toml
+config/clusters/*.toml
+!config/clusters/.gitkeep
 .state/*
 !.state/.gitkeep
 __pycache__/
 *.pyc
 *.log
+*.patch

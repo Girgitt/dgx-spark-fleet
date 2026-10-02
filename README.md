@@ -30,13 +30,47 @@ The submodules are pinned by this repository. `fleet.py sources update` delibera
 
 These are upstream repositories with their own licenses. This repository does not copy their source into its own tree or relicense it.
 
-## First bootstrap
+## First bootstrap and named clusters
+
+Initialize the source recipes once:
 
 ```bash
 git submodule update --init --recursive
-./fleet.py init-config
-$EDITOR config/cluster.toml
 ```
+
+Physical clusters are managed as **named inventories**. Create one inventory per cluster instead of copying a single `cluster.toml` around:
+
+```bash
+./fleet.py cluster init lab-tp2
+$EDITOR config/clusters/lab-tp2.toml
+./fleet.py cluster use lab-tp2
+```
+
+Create another independently:
+
+```bash
+./fleet.py cluster init production-tp4
+$EDITOR config/clusters/production-tp4.toml
+```
+
+Useful inventory commands:
+
+```bash
+./fleet.py cluster list
+./fleet.py cluster current
+./fleet.py cluster show lab-tp2
+./fleet.py cluster validate lab-tp2
+./fleet.py cluster clone lab-tp2 lab2-tp2
+```
+
+`cluster use NAME` selects the default cluster for subsequent commands. For a one-off operation, override it without changing the default:
+
+```bash
+./fleet.py --cluster production-tp4 network discover
+./fleet.py --cluster lab-tp2 profile status v41-vision-exl3-vllm-tp2
+```
+
+Every machine-affecting command prints the selected cluster and inventory path before doing work. If more than one inventory exists and no active cluster is selected, `fleet.py` refuses to guess.
 
 Start by discovering the actual ConnectX mapping on every node:
 
@@ -44,7 +78,7 @@ Start by discovering the actual ConnectX mapping on every node:
 ./fleet.py network discover
 ```
 
-Do **not** guess `enp...`/`roce...` names from the examples. Put the interfaces shown as `Up` into `config/cluster.toml`.
+Do **not** guess `enp...`/`roce...` names from the examples. Put the interfaces shown as `Up` into the selected `config/clusters/<name>.toml`.
 
 Render the netplan that would be installed:
 
@@ -163,6 +197,25 @@ That keeps the upstream checkout clean and makes the site-specific delta auditab
 
 There is one intentional limitation: the V4 upstream launcher's exact deployed Docker tag is a local-only image. `profile prepare v4-vision-...` checks for that image and stops with an actionable error if it is missing. Build/restore the image according to the pinned upstream recipe rather than silently substituting a different runtime. Model weights likewise remain an upstream/site responsibility; each node's `model_host` controls the host mount used by the rendered launcher.
 
+## Multiple physical clusters and state isolation
+
+The selected physical cluster is not just a filename shortcut. Runtime state is namespaced by cluster:
+
+```text
+.state/active-cluster
+.state/clusters/lab-tp2/active-profile
+.state/clusters/lab-tp2/netplan/...
+.state/clusters/lab-tp2/rendered/...
+.state/clusters/production-tp4/active-profile
+...
+```
+
+This prevents a model active on one cluster from being mistaken for the active deployment on another. Upstream MiaAI recipes still use their own `.env` files inside the submodules, so `fleet.py` deliberately regenerates the selected cluster's `.env` immediately before start, stop, or status operations. That avoids stale cluster-B addresses being used while operating on cluster A.
+
+Real cluster inventory files are ignored by Git by default (`config/clusters/*.toml`) because they may contain private hostnames, internal addresses and local SSH-key paths. The directory itself is retained in Git. If you intentionally want an inventory under version control, add it explicitly after considering that information exposure.
+
+`./fleet.py init-config` remains only as a compatibility alias that creates `config/clusters/default.toml`; new setups should use `cluster init NAME`. The old explicit `--config PATH` mode also remains available for advanced/legacy use.
+
 ## What is static vs switched
 
 Static fleet state:
@@ -202,7 +255,8 @@ If you want one invariant model alias as well as one invariant port, change `ser
 - `network render` before `network apply`.
 - Keep management traffic on a different NIC from RoCE.
 - Profile switching never changes netplan.
-- Generated recipe config is derived from checked-in profile TOML plus ignored `config/cluster.toml`.
+- Generated recipe config is derived from checked-in profile TOML plus the selected ignored `config/clusters/<name>.toml`.
+- Active profile, rendered netplan, and generated launchers are isolated under `.state/clusters/<name>/`.
 - Upstream submodules remain pinned; updates are explicit.
 - `.state/active-profile` is local controller state only. If a start fails, inspect upstream logs before treating the switch as complete.
 - For the V4 launcher, missing patch/vision files or model mounts cause the upstream launcher to fail before serving rather than silently continuing.

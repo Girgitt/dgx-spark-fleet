@@ -1,6 +1,8 @@
 version = 1
 
 [cluster]
+# id is inserted automatically by `fleet.py cluster init NAME`.
+# description = "Two direct-connected Sparks in lab A"
 # Run fleet.py on spark1/head. It orchestrates the other Sparks over SSH.
 ssh_user = "nvidia"
 ssh_identity = "~/.ssh/id_ed25519"

@@ -18,8 +18,11 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG = ROOT / "config" / "cluster.toml"
-STATE = ROOT / ".state"
+CLUSTERS_DIR = ROOT / "config" / "clusters"
+LEGACY_CONFIG = ROOT / "config" / "cluster.toml"
+STATE_ROOT = ROOT / ".state"
+ACTIVE_CLUSTER_FILE = STATE_ROOT / "active-cluster"
+STATE = STATE_ROOT
 PROFILES = ROOT / "profiles"
 
 
@@ -53,13 +56,104 @@ def load_toml(path: Path):
 
 def load_cluster(path: Path):
     if not path.exists():
-        raise SystemExit(
-            f"Missing {path}. Run './fleet.py init-config', edit the file, then run network discover."
-        )
+        raise SystemExit(f"Missing cluster inventory: {path}")
     cfg = load_toml(path)
     if cfg.get("version") != 1:
         raise SystemExit("Unsupported cluster config version")
     return cfg
+
+
+def safe_cluster_name(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise SystemExit("Cluster name may contain only letters, digits, '.', '_' and '-' and must start with a letter or digit")
+    return name
+
+
+def cluster_path(name: str) -> Path:
+    return CLUSTERS_DIR / f"{safe_cluster_name(name)}.toml"
+
+
+def active_cluster_name():
+    return ACTIVE_CLUSTER_FILE.read_text().strip() if ACTIVE_CLUSTER_FILE.exists() else None
+
+
+def set_active_cluster(name: str):
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    ACTIVE_CLUSTER_FILE.write_text(safe_cluster_name(name) + "\n")
+
+
+def cluster_inventory_names():
+    if not CLUSTERS_DIR.exists():
+        return []
+    return [p.stem for p in sorted(CLUSTERS_DIR.glob("*.toml"))]
+
+
+def validate_cluster_inventory(cluster, name: str, path: Path, *, require_roce=False):
+    meta = cluster.get("cluster", {})
+    declared = meta.get("id")
+    if declared and declared != name:
+        raise SystemExit(f"Cluster inventory identity mismatch: filename selects {name!r}, but [cluster].id is {declared!r} in {path}")
+    nodes = all_nodes(cluster)
+    if not nodes:
+        raise SystemExit(f"Cluster {name!r} has no nodes")
+    local = [n["name"] for n in nodes if n.get("local", False)]
+    if len(local) > 1:
+        raise SystemExit(f"Cluster {name!r} has multiple local=true nodes: {', '.join(local)}")
+    seen = {}
+    for n in nodes:
+        for p in n.get("roce") or []:
+            addr = p.get("address")
+            if addr:
+                ip = ip_only(addr)
+                if ip in seen:
+                    raise SystemExit(f"Duplicate RoCE IP {ip}: {seen[ip]} and {n['name']}")
+                seen[ip] = n["name"]
+            if require_roce and "CHANGE_ME" in (p.get("ifname", ""), p.get("ibdev", "")):
+                raise SystemExit(f"Cluster {name!r}: node {n['name']} still has CHANGE_ME RoCE values")
+    return True
+
+
+def set_runtime_state(name: str):
+    global STATE
+    STATE = STATE_ROOT / "clusters" / safe_cluster_name(name)
+    STATE.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_cluster(args, *, announce=True, require_roce=False):
+    if getattr(args, "config", None):
+        path = Path(args.config).expanduser().resolve()
+        cluster = load_cluster(path)
+        name = cluster.get("cluster", {}).get("id") or path.stem
+        safe_cluster_name(name)
+    else:
+        name = getattr(args, "cluster", None) or active_cluster_name()
+        if not name:
+            names = cluster_inventory_names()
+            if len(names) == 1:
+                name = names[0]
+            elif LEGACY_CONFIG.exists():
+                path = LEGACY_CONFIG
+                cluster = load_cluster(path)
+                name = cluster.get("cluster", {}).get("id") or "legacy"
+                set_runtime_state(name)
+                if announce:
+                    print(f"CLUSTER: {name} ({path.relative_to(ROOT)}) [legacy config]")
+                return cluster, name, path
+            else:
+                raise SystemExit("No cluster selected. Run './fleet.py cluster list' and './fleet.py cluster use NAME', or pass --cluster NAME.")
+        path = cluster_path(name)
+        cluster = load_cluster(path)
+    validate_cluster_inventory(cluster, name, path, require_roce=require_roce)
+    set_runtime_state(name)
+    if announce:
+        try:
+            shown = path.relative_to(ROOT)
+        except ValueError:
+            shown = path
+        desc = cluster.get("cluster", {}).get("description", "")
+        suffix = f" — {desc}" if desc else ""
+        print(f"CLUSTER: {name} ({shown}){suffix}")
+    return cluster, name, path
 
 
 def profile_path(name: str) -> Path:
@@ -519,13 +613,93 @@ def clear_active(name=None):
         p.unlink()
 
 
-def cmd_init_config(args):
-    dst = Path(args.config)
-    if dst.exists() and not args.force:
+def write_cluster_inventory(dst: Path, name: str, *, force=False, source=None):
+    if dst.exists() and not force:
         raise SystemExit(f"{dst} already exists; use --force to replace it")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / "config/cluster.example.toml", dst)
-    print(f"Created {dst}. Edit SSH/control addresses and RoCE interface names before applying network.")
+    src = source or (ROOT / "config" / "cluster.example.toml")
+    text = src.read_text()
+    if re.search(r'(?m)^id\s*=.*$', text):
+        text = re.sub(r'(?m)^id\s*=.*$', f'id = {json.dumps(name)}', text, count=1)
+    else:
+        text = text.replace('[cluster]\n', f'[cluster]\nid = {json.dumps(name)}\n', 1)
+    dst.write_text(text)
+    os.chmod(dst, 0o600)
+    return dst
+
+
+def cmd_init_config(args):
+    # Backward-compatible alias: create a named inventory called "default" unless --config is explicit.
+    if args.config:
+        dst = Path(args.config).expanduser()
+        name = dst.stem
+    else:
+        name = "default"
+        dst = cluster_path(name)
+    write_cluster_inventory(dst, name, force=args.force)
+    print(f"Created {dst}. Prefer './fleet.py cluster use {name}' before operating on machines.")
+
+
+def cmd_cluster(args):
+    if args.action == "list":
+        active = active_cluster_name()
+        names = cluster_inventory_names()
+        if not names:
+            print("No named cluster inventories. Create one with: ./fleet.py cluster init NAME")
+            return
+        for name in names:
+            path = cluster_path(name)
+            try:
+                cfg = load_cluster(path)
+                desc = cfg.get("cluster", {}).get("description", "")
+                marker = "*" if name == active else " "
+                print(f"{marker} {name:24} {desc}")
+            except (Exception, SystemExit) as e:
+                print(f"! {name:24} INVALID: {e}")
+        return
+    if args.action == "current":
+        name = active_cluster_name()
+        if not name:
+            print("No active cluster selected")
+            return
+        print(name)
+        return
+    if args.action == "init":
+        name = safe_cluster_name(args.name)
+        dst = cluster_path(name)
+        write_cluster_inventory(dst, name, force=args.force)
+        print(f"Created {dst.relative_to(ROOT)}")
+        print(f"Edit it, then select it with: ./fleet.py cluster use {name}")
+        return
+    if args.action == "clone":
+        src_name = safe_cluster_name(args.name)
+        dst_name = safe_cluster_name(args.new_name)
+        src = cluster_path(src_name)
+        if not src.exists():
+            raise SystemExit(f"Unknown cluster: {src_name}")
+        dst = cluster_path(dst_name)
+        write_cluster_inventory(dst, dst_name, force=args.force, source=src)
+        print(f"Cloned {src_name} -> {dst_name}: {dst.relative_to(ROOT)}")
+        return
+    raw_name = args.name or active_cluster_name()
+    if not raw_name:
+        raise SystemExit("No cluster selected")
+    name = safe_cluster_name(raw_name)
+    path = cluster_path(name)
+    if args.action == "use":
+        cfg = load_cluster(path)
+        validate_cluster_inventory(cfg, name, path)
+        set_active_cluster(name)
+        set_runtime_state(name)
+        print(f"Active cluster: {name} ({path.relative_to(ROOT)})")
+    elif args.action == "show":
+        cfg = load_cluster(path)
+        validate_cluster_inventory(cfg, name, path)
+        print(path.read_text(), end="")
+    elif args.action == "validate":
+        cfg = load_cluster(path)
+        validate_cluster_inventory(cfg, name, path, require_roce=args.require_roce)
+        print(f"Cluster {name}: OK")
 
 
 def cmd_sources(args):
@@ -539,7 +713,7 @@ def cmd_sources(args):
 
 
 def cmd_network(args):
-    cluster = load_cluster(Path(args.config))
+    cluster, _, _ = resolve_cluster(args, require_roce=(args.action != "discover"))
     nodes = all_nodes(cluster)
     if args.action == "discover":
         cmd = "hostname; echo '--- ibdev2netdev'; ibdev2netdev || true; echo '--- rdma'; rdma link || true; echo '--- addresses'; ip -br addr"
@@ -577,7 +751,7 @@ def cmd_network(args):
 
 
 def cmd_bootstrap(args):
-    cluster = load_cluster(Path(args.config))
+    cluster, _, _ = resolve_cluster(args)
     script = (ROOT / "scripts/bootstrap-node.sh").read_text()
     for n in all_nodes(cluster):
         print(f"\n===== {n['name']} =====")
@@ -593,13 +767,13 @@ def cmd_bootstrap(args):
 
 
 def cmd_profile(args):
+    cluster, _, _ = resolve_cluster(args, announce=(args.action != "list"))
     if args.action == "list":
         for pid, title in list_profiles():
             marker = "*" if active_profile_name() == pid else " "
             print(f"{marker} {pid:30} {title}")
         return
     profile = load_profile(args.name)
-    cluster = load_cluster(Path(args.config))
     if args.action == "show":
         print(json.dumps(profile, indent=2))
     elif args.action == "configure":
@@ -612,21 +786,25 @@ def cmd_profile(args):
         if not args.no_health:
             wait_health(cluster, profile)
     elif args.action == "stop":
+        configure_profile(cluster, profile)
         stop_profile(cluster, profile)
         clear_active(profile["id"])
     elif args.action == "status":
+        configure_profile(cluster, profile)
         status_profile(cluster, profile)
     elif args.action == "smoke":
         smoke_profile(cluster, profile, args.api_key)
 
 
 def cmd_switch(args):
-    cluster = load_cluster(Path(args.config))
+    cluster, _, _ = resolve_cluster(args)
     target = load_profile(args.name)
     active = active_profile_name()
     if active and active != target["id"]:
         print(f"Stopping active profile {active}...")
-        stop_profile(cluster, load_profile(active))
+        active_profile = load_profile(active)
+        configure_profile(cluster, active_profile)
+        stop_profile(cluster, active_profile)
         clear_active(active)
     configure_profile(cluster, target)
     if args.prepare:
@@ -639,12 +817,22 @@ def cmd_switch(args):
 
 def build_parser():
     p = argparse.ArgumentParser(description="DGX Spark DeepSeek deployment/profile controller")
-    p.add_argument("--config", default=str(DEFAULT_CONFIG))
+    sel = p.add_mutually_exclusive_group()
+    sel.add_argument("--cluster", help="named inventory under config/clusters/ (overrides active cluster for this command)")
+    sel.add_argument("--config", help="advanced/legacy: explicit inventory path; bypasses active-cluster selection")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    q = sub.add_parser("init-config")
+    q = sub.add_parser("init-config", help="backward-compatible alias that creates the named 'default' inventory")
     q.add_argument("--force", action="store_true")
     q.set_defaults(func=cmd_init_config)
+
+    q = sub.add_parser("cluster", help="manage named physical cluster inventories")
+    q.add_argument("action", choices=["list", "current", "init", "clone", "use", "show", "validate"])
+    q.add_argument("name", nargs="?")
+    q.add_argument("new_name", nargs="?")
+    q.add_argument("--force", action="store_true")
+    q.add_argument("--require-roce", action="store_true", help="validation also rejects unresolved CHANGE_ME RoCE values")
+    q.set_defaults(func=cmd_cluster)
 
     q = sub.add_parser("sources")
     q.add_argument("action", choices=["init", "status", "update"])
@@ -678,6 +866,11 @@ def main():
     args = parser.parse_args()
     if args.cmd == "profile" and args.action != "list" and not args.name:
         parser.error("profile action requires NAME")
+    if args.cmd == "cluster":
+        if args.action in {"init", "use", "clone"} and not args.name:
+            parser.error(f"cluster {args.action} requires NAME")
+        if args.action == "clone" and not args.new_name:
+            parser.error("cluster clone requires SOURCE NEW_NAME")
     args.func(args)
 
 

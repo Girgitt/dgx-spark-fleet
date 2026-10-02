@@ -46,6 +46,49 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(fleet.ip_only("192.168.192.10/24"), "192.168.192.10")
         self.assertEqual(fleet.net_only("192.168.192.10/24"), "192.168.192.0/24")
 
+
+    def test_named_cluster_inventory_sets_identity(self):
+        old_root, old_clusters = fleet.ROOT, fleet.CLUSTERS_DIR
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                td = Path(td)
+                fleet.ROOT = td
+                fleet.CLUSTERS_DIR = td / "config" / "clusters"
+                (td / "config").mkdir()
+                (td / "config" / "cluster.example.toml").write_text(
+                    'version = 1\n\n[cluster]\nssh_user = "nvidia"\n'
+                )
+                out = fleet.write_cluster_inventory(fleet.CLUSTERS_DIR / "lab-a.toml", "lab-a")
+                cfg = fleet.load_toml(out)
+                self.assertEqual(cfg["cluster"]["id"], "lab-a")
+        finally:
+            fleet.ROOT, fleet.CLUSTERS_DIR = old_root, old_clusters
+
+    def test_active_profile_is_isolated_per_cluster(self):
+        old_state, old_root = fleet.STATE, fleet.STATE_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                fleet.STATE_ROOT = Path(td)
+                fleet.set_runtime_state("lab-a")
+                fleet.set_active("model-a")
+                fleet.set_runtime_state("lab-b")
+                self.assertIsNone(fleet.active_profile_name())
+                fleet.set_active("model-b")
+                fleet.set_runtime_state("lab-a")
+                self.assertEqual(fleet.active_profile_name(), "model-a")
+                fleet.set_runtime_state("lab-b")
+                self.assertEqual(fleet.active_profile_name(), "model-b")
+        finally:
+            fleet.STATE, fleet.STATE_ROOT = old_state, old_root
+
+    def test_cluster_identity_mismatch_is_rejected(self):
+        cluster = {
+            "cluster": {"id": "wrong"},
+            "nodes": {"spark1": {"local": True, "roce": []}},
+        }
+        with self.assertRaises(SystemExit):
+            fleet.validate_cluster_inventory(cluster, "expected", Path("expected.toml"))
+
     def test_v4_launcher_render_fixture(self):
         old_root, old_state = fleet.ROOT, fleet.STATE
         try:
