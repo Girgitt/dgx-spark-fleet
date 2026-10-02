@@ -1,0 +1,9 @@
+# Reference addressing for two directly cabled Sparks.
+# Copy the relevant values into config/cluster.toml after network discovery.
+# Two planes are useful only if `ibdev2netdev` shows both logical interfaces Up.
+[spark1]
+plane0 = "192.168.100.10/24"
+plane1 = "192.168.101.10/24"
+[spark2]
+plane0 = "192.168.100.11/24"
+plane1 = "192.168.101.11/24"

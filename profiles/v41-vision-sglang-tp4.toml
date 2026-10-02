@@ -1,0 +1,16 @@
+id = "v41-vision-sglang-tp4"
+title = "DeepSeek V4.1 Flash Vision / native / SGLang / TP4"
+adapter = "mia_sglang_tp4"
+source = "sources/v41-sglang"
+topology = "tp4"
+port = 8888
+env_example = ".env.tp4.example"
+env_file = ".env.tp4"
+served_model = "deepseek-v4.1-flash"
+
+[env]
+NNODES = "4"
+TP_SIZE = "4"
+NFS_SHARE = "1"
+SKIP_SMOKE = "0"
+SMOKE_QUICK = "1"

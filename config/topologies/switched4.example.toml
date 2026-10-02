@@ -1,0 +1,14 @@
+# Reference addressing for four Sparks through a CRS812-class switched RoCE fabric.
+# No gateway/default route belongs on this fabric.
+[spark1]
+plane0 = "192.168.192.10/24"
+plane1 = "192.168.193.10/24"
+[spark2]
+plane0 = "192.168.192.11/24"
+plane1 = "192.168.193.11/24"
+[spark3]
+plane0 = "192.168.192.12/24"
+plane1 = "192.168.193.12/24"
+[spark4]
+plane0 = "192.168.192.13/24"
+plane1 = "192.168.193.13/24"

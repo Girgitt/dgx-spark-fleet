@@ -1,0 +1,14 @@
+id = "v41-vision-exl3-vllm-tp2"
+title = "DeepSeek V4.1 Flash Vision / EXL3 2.9bpw / vLLM / TP2"
+adapter = "mia_exl3"
+source = "sources/v41-exl3-vllm"
+topology = "tp2"
+port = 8888
+served_model = "DeepSeek-v4.1-Flash-EXL3"
+env_example = ".env.example"
+env_file = ".env"
+
+[env]
+LANGUAGE_MODEL_ONLY = "0"
+WEIGHT_SYNC = "nfs"
+NFS_SHARE = "1"

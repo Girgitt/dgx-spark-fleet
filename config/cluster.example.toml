@@ -1,0 +1,65 @@
+version = 1
+
+[cluster]
+# Run fleet.py on spark1/head. It orchestrates the other Sparks over SSH.
+ssh_user = "nvidia"
+ssh_identity = "~/.ssh/id_ed25519"
+# Management NIC used for SSH/Gloo in recipes which separate control and RoCE.
+management_interface = "enP7s7"
+# Optional; 0 means leave MTU unchanged in generated netplan.
+roce_mtu = 0
+
+[topologies.tp2]
+nodes = ["spark1", "spark2"]
+
+[topologies.tp4]
+nodes = ["spark1", "spark2", "spark3", "spark4"]
+
+# Spark 1 is the machine where this orchestration repository is cloned.
+[nodes.spark1]
+local = true
+ssh_host = "spark1"
+control_ip = "192.168.10.101"
+model_host = "/var/tmp/models"
+
+[[nodes.spark1.roce]]
+ifname = "CHANGE_ME"
+ibdev = "CHANGE_ME"
+address = "192.168.192.10/24"
+
+# Optional second logical CX-7 interface/plane. Leave this table commented out
+# until `./fleet.py network discover` confirms which interfaces are Up.
+# [[nodes.spark1.roce]]
+# ifname = "CHANGE_ME"
+# ibdev = "CHANGE_ME"
+# address = "192.168.193.10/24"
+
+[nodes.spark2]
+ssh_host = "spark2"
+control_ip = "192.168.10.102"
+model_host = "/var/tmp/models"
+
+[[nodes.spark2.roce]]
+ifname = "CHANGE_ME"
+ibdev = "CHANGE_ME"
+address = "192.168.192.11/24"
+
+[nodes.spark3]
+ssh_host = "spark3"
+control_ip = "192.168.10.103"
+model_host = "/var/tmp/models"
+
+[[nodes.spark3.roce]]
+ifname = "CHANGE_ME"
+ibdev = "CHANGE_ME"
+address = "192.168.192.12/24"
+
+[nodes.spark4]
+ssh_host = "spark4"
+control_ip = "192.168.10.104"
+model_host = "/var/tmp/models"
+
+[[nodes.spark4.roce]]
+ifname = "CHANGE_ME"
+ibdev = "CHANGE_ME"
+address = "192.168.192.13/24"

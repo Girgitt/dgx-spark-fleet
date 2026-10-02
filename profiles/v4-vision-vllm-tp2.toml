@@ -1,0 +1,12 @@
+id = "v4-vision-vllm-tp2"
+title = "DeepSeek V4 Flash Vision Exp / vLLM / DSpark / TP2"
+adapter = "v4_launcher"
+source = "sources/v4-vision-vllm"
+topology = "tp2"
+port = 8888
+served_model = "deepseek-v4-flash-dspark"
+launcher = "launchers/ds4-vision-tp2.sh"
+container = "vllm_ds4_vision"
+master_port = 25440
+model_dir = "DeepSeek-V4-Flash-Vision-Exp"
+image = "vllm-dspark-runtime:mia-raf-pr1-nvfp4-probe-c-keys-concurrency-p2b"
