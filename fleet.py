@@ -345,6 +345,20 @@ def configure_mia_exl3(cluster, profile):
         "NNODES": 2,
         "SERVED_MODEL_NAME": profile.get("served_model", "DeepSeek-v4.1-Flash-EXL3"),
     }
+    # The simplified fleet reconciles model artifacts before recipe lifecycle
+    # execution.  Job 30 supplies the canonical node-local paths explicitly so
+    # upstream prepare/start never downloads into this staged source tree.
+    for env_name, env_key in (
+        ("DGX_MODEL_HOST", "MODEL_HOST"),
+        ("DGX_ENGRAM_DIR", "ENGRAM_DIR"),
+        ("DGX_WORKER_MODEL_DIR", "WORKER_MODEL_DIR"),
+        ("DGX_WORKER_ENGRAM_DIR", "WORKER_ENGRAM_DIR"),
+    ):
+        value = os.environ.get(env_name)
+        if value:
+            overrides[env_key] = value
+    if os.environ.get("DGX_RECONCILED_MODELS") == "1":
+        overrides["AUTO_DOWNLOAD"] = "0"
     overrides.update({k: str(v) for k, v in profile.get("env", {}).items()})
     merge_env(example, target, overrides)
     print(f"Wrote {target.relative_to(ROOT)}")
@@ -394,6 +408,9 @@ def configure_mia_sglang_tp4(cluster, profile):
         "NNODES": 4,
         "TP_SIZE": 4,
     }
+    model_dir = os.environ.get("DGX_MODEL_DIR")
+    if model_dir:
+        overrides["MODEL_DIR"] = model_dir
     overrides.update({k: str(v) for k, v in profile.get("env", {}).items()})
     merge_env(example, target, overrides)
     print(f"Wrote {target.relative_to(ROOT)}")
@@ -428,7 +445,7 @@ def render_v4_launcher(cluster, profile):
         headless = "" if rank == 0 else "--headless"
         case_lines.append(
             f"  {rank}) HOST_IP={shlex.quote(ip_only(p['address']))}; "
-            f"HEADLESS={shlex.quote(headless)}; MODELS_HOST={shlex.quote(node.get('model_host','/var/tmp/models'))}; "
+            f"HEADLESS={shlex.quote(headless)}; MODELS_HOST={shlex.quote(os.environ.get('DGX_V4_MODELS_HOST') or node.get('model_host','/var/tmp/models'))}; "
             f"FLEET_NCCL_IB_HCA={shlex.quote(p['ibdev'])}; FLEET_SOCKET_IF={shlex.quote(p['ifname'])} ;;"
         )
     case_lines += [f'  *) echo "rank must be 0..{len(nodes)-1}" >&2; exit 2 ;;', 'esac']
@@ -509,11 +526,14 @@ def prepare_profile(cluster, profile):
         v4_stage_files(cluster, profile)
         return
     if adapter == "mia_exl3":
-        # Download-only stage is resumable; start.sh handles image/NFS/launch itself.
-        run(["./download.sh"], cwd=src)
+        if os.environ.get("DGX_RECONCILED_MODELS") == "1":
+            print("Model artifacts already reconciled by Job 20; skipping upstream download.sh")
+        else:
+            run(["./download.sh"], cwd=src)
         return
     if adapter == "mia_sglang_tp4":
-        for step in ("doctor", "build", "download", "share", "pack"):
+        steps = ["doctor", "build", "share", "pack"] if os.environ.get("DGX_RECONCILED_MODELS") == "1" else ["doctor", "build", "download", "share", "pack"]
+        for step in steps:
             run(["./start-tp4.sh", step], cwd=src)
         return
 

@@ -1,0 +1,9 @@
+id = "v41-native-sglang"
+title = "DeepSeek V4.1 Flash Vision / native / SGLang"
+adapter = "recipes/profile-bridge.sh"
+enabled = true
+source = "sources/v41-sglang"
+artifact_provider = "recipes/artifacts/mia_sglang.py"
+supported_tp = [4]
+[profiles]
+"4" = "v41-vision-sglang-tp4"

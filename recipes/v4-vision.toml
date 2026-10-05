@@ -1,0 +1,10 @@
+id = "v4-vision"
+title = "DeepSeek V4 Flash Vision / vLLM / DSpark"
+adapter = "recipes/profile-bridge.sh"
+enabled = true
+source = "sources/v4-vision-vllm"
+artifact_provider = "recipes/artifacts/v4_vision.py"
+supported_tp = [2, 4]
+[profiles]
+"2" = "v4-vision-vllm-tp2"
+"4" = "v4-vision-vllm-tp4"

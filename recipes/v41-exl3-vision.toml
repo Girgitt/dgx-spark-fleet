@@ -1,0 +1,9 @@
+id = "v41-exl3-vision"
+title = "DeepSeek V4.1 Flash Vision / EXL3 / vLLM"
+adapter = "recipes/profile-bridge.sh"
+enabled = true
+source = "sources/v41-exl3-vllm"
+artifact_provider = "recipes/artifacts/mia_exl3.py"
+supported_tp = [2]
+[profiles]
+"2" = "v41-vision-exl3-vllm-tp2-local"

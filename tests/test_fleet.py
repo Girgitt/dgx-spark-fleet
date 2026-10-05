@@ -1,7 +1,9 @@
 import importlib.util
+import os
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("fleet", ROOT / "fleet.py")
@@ -124,6 +126,41 @@ class FleetTests(unittest.TestCase):
                 self.assertIn('NCCL_SOCKET_IFNAME="$FLEET_SOCKET_IF"', out)
         finally:
             fleet.ROOT, fleet.STATE = old_root, old_state
+
+    def test_exl3_configuration_uses_reconciled_model_paths_and_disables_download(self):
+        old_root=fleet.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                td=Path(td)
+                fleet.ROOT=td
+                src=td/"sources"/"exl3"
+                src.mkdir(parents=True)
+                (src/".env.example").write_text("HEAD_IP=x\nWORKER_IP=y\nAUTO_DOWNLOAD=1\n")
+                cluster={
+                    "cluster":{"ssh_user":"admin"},
+                    "topologies":{"tp2":{"nodes":["node1","node2"]}},
+                    "nodes":{
+                        "node1":{"local":True,"roce":[{"ifname":"if1","ibdev":"ib1","address":"10.1.0.1/24"}]},
+                        "node2":{"ssh_host":"mng-node2","roce":[{"ifname":"if2","ibdev":"ib2","address":"10.1.0.2/24"}]},
+                    },
+                }
+                profile={"id":"p","adapter":"mia_exl3","source":"sources/exl3","topology":"tp2","env_example":".env.example","env_file":".env","env":{}}
+                env={
+                    "DGX_RECONCILED_MODELS":"1",
+                    "DGX_MODEL_HOST":"/models/exl3",
+                    "DGX_ENGRAM_DIR":"/models/native",
+                    "DGX_WORKER_MODEL_DIR":"/models/exl3",
+                    "DGX_WORKER_ENGRAM_DIR":"/models/native",
+                }
+                with mock.patch.dict(os.environ,env,clear=False):
+                    out=fleet.configure_mia_exl3(cluster,profile).read_text()
+                self.assertIn("MODEL_HOST=/models/exl3",out)
+                self.assertIn("ENGRAM_DIR=/models/native",out)
+                self.assertIn("WORKER_MODEL_DIR=/models/exl3",out)
+                self.assertIn("AUTO_DOWNLOAD=0",out)
+        finally:
+            fleet.ROOT=old_root
+
 
 
 if __name__ == "__main__":
