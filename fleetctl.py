@@ -1402,7 +1402,17 @@ def _download_artifact_on_node(cfg, idx, artifact, target):
     if rev: args += ['--revision',shlex.quote(rev)]
     for name in include: args += ['--include',shlex.quote(name)]
     args += ['--local-dir',shlex.quote(target)]
-    command=setup + " ".join(args)
+    download_command=" ".join(args)
+    command=(
+        setup +
+        'rc=1; for attempt in 1 2 3; do '
+        f'if {download_command}; then rc=0; break; else rc=$?; fi; '
+        'if [ "$attempt" -lt 3 ]; then '
+        'echo "hf download attempt ${attempt}/3 failed (rc=${rc}); retrying resumable download" >&2; '
+        'sleep $((attempt * 10)); '
+        'else echo "hf download attempt ${attempt}/3 failed (rc=${rc}); giving up" >&2; fi; '
+        'done; exit "$rc"'
+    )
     auth="authenticated (HF_TOKEN forwarded transiently)" if token else "anonymous (HF_TOKEN not set)"
     print(f"\n== download on node{idx}: {repo}{('@'+rev) if rev else ''} [{auth}] ==")
     r=ssh(cfg,idx,command,check=False,input_text=input_text)
@@ -1413,6 +1423,66 @@ def _download_artifact_on_node(cfg, idx, artifact, target):
         )
 
 
+def _refresh_reconcile_entry(entry):
+    probes=entry["probes"]
+    complete=[idx for idx,p in probes.items() if p.get("state")=="complete"]
+    entry["source"]=sorted(complete)[0] if complete else None
+    entry["partial"]=[idx for idx,p in probes.items() if p.get("state")=="partial"]
+    entry["candidates"]=[idx for idx,p in probes.items() if p.get("state")=="candidate"]
+
+
+def _suppress_candidates_claimed_by_other_artifacts(cfg, plan):
+    """Do not let one positively identified artifact masquerade as another.
+
+    Quantized/derived checkpoints can legitimately embed the upstream Hugging Face
+    repository id in config metadata.  That hint is useful for discovering renamed
+    artifacts, but it must not make a directory already positively identified for a
+    different recipe requirement block reconciliation of the real upstream model.
+    """
+    claimed={}
+    for entry in plan:
+        artifact=entry["artifact"]
+        identity=_artifact_identity(artifact)
+        for idx,probe in entry["probes"].items():
+            if probe.get("state") not in {"complete","partial"}:
+                continue
+            path=probe.get("path")
+            if not path:
+                continue
+            key=posixpath.normpath(path)
+            claimed.setdefault(idx,{}).setdefault(key,[]).append(
+                {"identity":identity,"repo":artifact["repo"]}
+            )
+
+    for entry in plan:
+        artifact=entry["artifact"]
+        identity=_artifact_identity(artifact)
+        canonical=artifact_canonical_path(cfg,artifact)
+        for idx,probe in list(entry["probes"].items()):
+            if probe.get("state") != "candidate" or not probe.get("path"):
+                continue
+            path=posixpath.normpath(probe["path"])
+            owners=[x for x in claimed.get(idx,{}).get(path,[]) if x["identity"] != identity]
+            if not owners:
+                continue
+            entry["probes"][idx]={
+                "state":"missing",
+                "path":canonical,
+                "present":0,
+                "expected":0,
+                "score":0,
+                "reasons":[],
+                "bytes":0,
+                "revision_verified":False,
+                "ignored_candidate":{
+                    "path":path,
+                    "owner_repos":sorted({x["repo"] for x in owners}),
+                    "candidate_reasons":list(probe.get("reasons") or []),
+                },
+            }
+        _refresh_reconcile_entry(entry)
+
+
 def build_reconcile_plan(cfg, artifacts, inventories=None):
     indexes=[int(n["index"]) for n in ordered_nodes(cfg)]
     if inventories is None:
@@ -1420,11 +1490,10 @@ def build_reconcile_plan(cfg, artifacts, inventories=None):
     plan=[]
     for artifact in artifacts:
         probes={idx:classify_artifact_from_inventory(cfg,artifact,inventories[idx]) for idx in indexes}
-        complete=[idx for idx in indexes if probes[idx].get("state")=="complete"]
-        partial=[idx for idx in indexes if probes[idx].get("state")=="partial"]
-        candidates=[idx for idx in indexes if probes[idx].get("state")=="candidate"]
-        source=complete[0] if complete else None
-        plan.append({"artifact":artifact,"probes":probes,"source":source,"partial":partial,"candidates":candidates})
+        entry={"artifact":artifact,"probes":probes}
+        _refresh_reconcile_entry(entry)
+        plan.append(entry)
+    _suppress_candidates_claimed_by_other_artifacts(cfg,plan)
     return plan, inventories
 
 
@@ -1507,6 +1576,10 @@ def print_reconcile_plan(cluster_id, records, plan, inventories, *, download_mis
             reason=""
             if p.get("state")=="candidate" and p.get("reasons"):
                 reason="; " + ", ".join(p["reasons"][:3])
+            elif p.get("ignored_candidate"):
+                ignored=p["ignored_candidate"]
+                owners=", ".join(ignored.get("owner_repos") or [])
+                reason=f"; ignored candidate {ignored.get('path')} (already identified as {owners})"
             print(f"      node{idx}: {p.get('state','?'):9} {p.get('path','')}{detail}{rev_note}{reason}")
     print("\nPlan:")
     actions=0

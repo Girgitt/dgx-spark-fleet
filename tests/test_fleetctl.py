@@ -488,6 +488,62 @@ class SimpleFleetTests(unittest.TestCase):
         self.assertEqual(f._choose_download_seed(entry),2)
         self.assertEqual(f._choose_download_seed(entry,1),1)
 
+    def test_reconcile_plan_ignores_candidate_path_claimed_by_other_artifact(self):
+        c=cfg2()
+        native_rev="f"*40
+        exl3={
+            "kind":"huggingface","format":"safetensors-directory",
+            "repo":"Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw",
+            "revision":"","mode":"full","expected_shards":39,
+            "legacy_names":["DeepSeek-V4.1-Flash-EXL3-2.9bpw"],"recipes":["exl3"],
+        }
+        native={
+            "kind":"huggingface","format":"safetensors-directory",
+            "repo":"deepseek-ai/DeepSeek-V4.1-Flash",
+            "revision":native_rev,"mode":"full","expected_shards":48,
+            "legacy_names":["DeepSeek-V4.1-Flash"],"recipes":["native"],
+        }
+        exl3_path="/home/zbig/gguf/hf/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw"
+        native_path="/home/zbig/gguf/hf/deepseek-ai/DeepSeek-V4.1-Flash"
+        exl3_entry={
+            "path":exl3_path,"type":"directory","basename":"DeepSeek-V4.1-Flash-EXL3-2.9bpw",
+            "files":["config.json"],"config":{},
+            # Derived EXL3 checkpoints may retain the upstream model identity.
+            "repo_hints":["deepseek-ai/DeepSeek-V4.1-Flash"],
+            "hf_commits":["e"*40],"has_config":True,"has_index":False,
+            "index_expected":0,"index_present":0,"safetensors":39,"model_shards":39,
+            "ggufs":0,"weights":39,"bytes":123,
+        }
+        native_partial={
+            "path":native_path,"type":"directory","basename":"DeepSeek-V4.1-Flash",
+            "files":["config.json"],"config":{},"repo_hints":[],"hf_commits":[],
+            "has_config":True,"has_index":False,"index_expected":0,"index_present":0,
+            "safetensors":26,"model_shards":26,"ggufs":0,"weights":26,"bytes":456,
+        }
+        inventories={1:[exl3_entry,native_partial],2:[exl3_entry]}
+        plan,_=f.build_reconcile_plan(c,[exl3,native],inventories)
+        native_plan=plan[1]
+        self.assertEqual(native_plan["probes"][1]["state"],"partial")
+        self.assertEqual(native_plan["probes"][2]["state"],"missing")
+        self.assertEqual(native_plan["probes"][2]["path"],native_path)
+        ignored=native_plan["probes"][2]["ignored_candidate"]
+        self.assertEqual(ignored["path"],exl3_path)
+        self.assertEqual(ignored["owner_repos"],[exl3["repo"]])
+        self.assertEqual(native_plan["candidates"],[])
+        self.assertEqual(f._choose_download_seed(native_plan),1)
+
+    def test_hf_download_command_retries_resumable_failures(self):
+        c=cfg2()
+        artifact={"kind":"huggingface","repo":"org/model","revision":"","mode":"full","files":[]}
+        result=mock.Mock(returncode=0)
+        with mock.patch.dict(os.environ,{},clear=True), \
+             mock.patch.object(f,"ssh",return_value=result) as ssh_mock:
+            f._download_artifact_on_node(c,1,artifact,"/home/zbig/gguf/hf/org/model")
+        command=ssh_mock.call_args.args[2]
+        self.assertIn("for attempt in 1 2 3",command)
+        self.assertIn("retrying resumable download",command)
+        self.assertEqual(command.count('"$HFV/bin/hf" download'),1)
+
 
     def test_management_iface_uses_managed_peer_alias_not_raw_bootstrap_name(self):
         c=cfg2()
