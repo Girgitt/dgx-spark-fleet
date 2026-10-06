@@ -9,7 +9,9 @@ The design deliberately separates:
 - **upstream recipes** — pinned as Git submodules and left unmodified;
 - **large state** — model weights, Docker images, caches, Engram stores and generated `.env` files stay outside Git.
 
-Run this repository on the Spark that will be rank 0/head. It drives the remaining Sparks over SSH.
+Run this repository on a management host with SSH access to the DGX Sparks. The
+management host may be outside the DGX cluster; fleetctl stages recipe runtime
+work on the selected topology head and drives the remaining Sparks over SSH.
 
 ## Included deployment tracks
 
@@ -30,37 +32,59 @@ The submodules are pinned by this repository. `fleet.py sources update` delibera
 
 These are upstream repositories with their own licenses. This repository does not copy their source into its own tree or relicense it.
 
-## First bootstrap and named clusters
+## Management-host bootstrap and named clusters
 
-Initialize the source recipes once:
+The management host does not need to be a DGX Spark, but it does need a supported
+repo-local Python environment. Bootstrap it once from a fresh clone:
 
 ```bash
-git submodule update --init --recursive
+./scripts/bootstrap.sh
+```
+
+This follows the same repo-local environment pattern as Control Engineering Suite:
+it creates or reuses `./venv_py312`, installs the checkout and development
+dependencies from `pyproject.toml`, and initializes the pinned recipe submodules.
+The host must provide Python 3.12+ to create the venv. Override interpreter discovery
+with `DGX_FLEET_BOOTSTRAP_PYTHON=/path/to/python3.12` when needed.
+
+Use the shell launchers for normal operation; they always use the repo environment,
+so activation is not required:
+
+```bash
+./fleetctl --help
+./fleet --help
+```
+
+Direct `.py` invocation is also available after activation:
+
+```bash
+source venv_py312/bin/activate
+./fleetctl.py --help
 ```
 
 Physical clusters are managed as **named inventories**. Create one inventory per cluster instead of copying a single `cluster.toml` around:
 
 ```bash
-./fleet.py cluster init lab-tp2
+./fleet cluster init lab-tp2
 $EDITOR config/clusters/lab-tp2.toml
-./fleet.py cluster use lab-tp2
+./fleet cluster use lab-tp2
 ```
 
 Create another independently:
 
 ```bash
-./fleet.py cluster init production-tp4
+./fleet cluster init production-tp4
 $EDITOR config/clusters/production-tp4.toml
 ```
 
 Useful inventory commands:
 
 ```bash
-./fleet.py cluster list
-./fleet.py cluster current
-./fleet.py cluster show lab-tp2
-./fleet.py cluster validate lab-tp2
-./fleet.py cluster clone lab-tp2 lab2-tp2
+./fleet cluster list
+./fleet cluster current
+./fleet cluster show lab-tp2
+./fleet cluster validate lab-tp2
+./fleet cluster clone lab-tp2 lab2-tp2
 ```
 
 `cluster use NAME` selects the default cluster for subsequent commands. For a one-off operation, override it without changing the default:

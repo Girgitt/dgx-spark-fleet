@@ -751,7 +751,7 @@ def cmd_bootstrap_fabric(args):
         # Send program on stdin, execute through management network.
         user=ssh_user(cfg); host=n["management"]
         if is_local_address(host):
-            r=run(["python3","-",__import__('json').dumps(payload)],check=False,input_text=REMOTE_FABRIC)
+            r=run([sys.executable,"-",__import__('json').dumps(payload)],check=False,input_text=REMOTE_FABRIC)
         else:
             r=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=7",f"{user}@{host}",cmd],check=False,input_text=REMOTE_FABRIC)
         if r.returncode: failures.append(idx)
@@ -998,7 +998,7 @@ def _artifact_provider_manifest(recipe):
         )
     if not provider.exists():
         raise SystemExit(f"Recipe {recipe['id']}: missing artifact provider {provider}")
-    r = run([str(provider), "--source", str(source), "--recipe-id", recipe["id"]], capture=True, check=False)
+    r = run([sys.executable, str(provider), "--source", str(source), "--recipe-id", recipe["id"]], capture=True, check=False)
     if r.returncode:
         raise SystemExit(f"Recipe {recipe['id']}: artifact provider failed")
     try:
@@ -1206,7 +1206,7 @@ def inventory_model_root_on_node(cfg, idx):
     user=ssh_user(cfg); host=node(cfg,idx)["management"]
     cmd=f"python3 - {shlex.quote(root)}"
     if is_local_address(host):
-        r=run(["python3","-",root],check=False,capture=True,input_text=REMOTE_MODEL_INVENTORY)
+        r=run([sys.executable,"-",root],check=False,capture=True,input_text=REMOTE_MODEL_INVENTORY)
     else:
         r=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=7",f"{user}@{host}",cmd],check=False,capture=True,input_text=REMOTE_MODEL_INVENTORY)
     if r.returncode:

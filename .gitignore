@@ -8,3 +8,4 @@ __pycache__/
 *.log
 *.patch
 .idea
+venv_py312/

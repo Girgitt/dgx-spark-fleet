@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -417,7 +418,7 @@ class SimpleFleetTests(unittest.TestCase):
             (model/"model-00001-of-00002.safetensors").write_bytes(b"x")
             (model/"model-00002-of-00002.safetensors").write_bytes(b"y")
             (root/"other.Q4_K_M.gguf").write_bytes(b"gguf")
-            r=subprocess.run(["python3","-",str(root)],input=f.REMOTE_MODEL_INVENTORY,
+            r=subprocess.run([sys.executable,"-",str(root)],input=f.REMOTE_MODEL_INVENTORY,
                              text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True)
             entries=json.loads(r.stdout)["entries"]
         paths={Path(e["path"]).name:e for e in entries}

@@ -11,4 +11,4 @@ if [[ $# -lt 4 ]]; then
   exit 2
 fi
 cluster=$1 topology=$2 path=$3 source=$4
-exec python3 "$ROOT/fleetctl.py" model-sync --cluster "$cluster" --topology "$topology" --path "$path" --source-node "$source"
+exec "$ROOT/scripts/python.sh" "$ROOT/fleetctl.py" model-sync --cluster "$cluster" --topology "$topology" --path "$path" --source-node "$source"
