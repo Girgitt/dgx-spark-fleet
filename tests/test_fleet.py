@@ -162,6 +162,36 @@ class FleetTests(unittest.TestCase):
             fleet.ROOT=old_root
 
 
+    def test_exl3_configuration_maps_cooperative_runtime_overrides(self):
+        old_root=fleet.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                td=Path(td); fleet.ROOT=td
+                src=td/"sources"/"exl3"; src.mkdir(parents=True)
+                (src/".env.example").write_text("HEAD_IP=x\nWORKER_IP=y\n")
+                cluster={
+                    "cluster":{"ssh_user":"admin"},
+                    "topologies":{"tp2":{"nodes":["node1","node2"]}},
+                    "nodes":{
+                        "node1":{"local":True,"roce":[{"ifname":"if1","ibdev":"ib1","address":"10.1.0.1/24"}]},
+                        "node2":{"ssh_host":"mng-node2","roce":[{"ifname":"if2","ibdev":"ib2","address":"10.1.0.2/24"}]},
+                    },
+                }
+                profile={"id":"p","adapter":"mia_exl3","source":"sources/exl3","topology":"tp2","env_example":".env.example","env_file":".env","env":{}}
+                env={
+                    "DGX_COOP_OVERLAY_HOST":"/home/admin/.cache/vllm-dsv41-flash-exl3/coop/abc/exl3-cooperative.py",
+                    "DGX_COOP_TEMP_ROWS_FUSED":"8",
+                    "DGX_COOP_IMAGE":"ghcr.io/example/image@sha256:abc",
+                }
+                with mock.patch.dict(os.environ,env,clear=False):
+                    out=fleet.configure_mia_exl3(cluster,profile).read_text()
+                self.assertIn("EXL3_OVERLAY_HOST=/home/admin/.cache/vllm-dsv41-flash-exl3/coop/abc/exl3-cooperative.py",out)
+                self.assertIn("EXL3_TEMP_ROWS_FUSED=8",out)
+                self.assertIn("IMAGE=ghcr.io/example/image@sha256:abc",out)
+        finally:
+            fleet.ROOT=old_root
+
+
 
 if __name__ == "__main__":
     unittest.main()

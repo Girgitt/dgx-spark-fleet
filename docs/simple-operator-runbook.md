@@ -211,12 +211,63 @@ If a complete model is already present under a legacy directory name, Job 20 reu
 
 `20-model-sync.sh` remains only as a deprecated explicit-path compatibility interface; new Rundeck jobs must use `20-model-reconcile.sh`.
 
+### Job 25 — reconcile and qualify native runtime artifacts
+
+Job 25 is separate from model reconciliation. It handles optional native runtime
+artifacts that must be pinned, copied to every rank and GPU-qualified before a
+recipe may use them. The current implementation registers cooperative MoE for the
+TP2 V4.1 EXL3 recipe as `v41-exl3-vision-coop`.
+
+Stop the stock/coop EXL3 service before running the GPU gate, then execute:
+
+```bash
+./scripts/25-runtime-reconcile.sh dgx-c1 tp2 \
+  --recipe v41-exl3-vision-coop \
+  --fetch --apply --gate
+```
+
+The phases are deliberate:
+
+1. `--fetch` fetches the exact external Git commit on the topology head only,
+   verifies `cooperative_moe.so` and its matching `runtime.py`, and generates the
+   cooperative overlay into a content-addressed node-local cache;
+2. `--apply` removes any previous qualification marker and replicates the verified
+   cache from the head to the other selected ranks over `con-*`;
+3. `--gate` requires the service stopped, verifies/pulls the immutable container
+   immutable image digest, accepts either Docker image-ID representation (containerd target digest or legacy config digest), and runs the 54-case CUDA integration gate
+   independently on every rank.
+
+Qualification state is recorded under:
+
+```text
+.state/simple/<cluster>/runtime/<topology>/<recipe>/state.json
+```
+
+and each Spark keeps its own `gate.json` beside the staged runtime artifact. Job
+30 rechecks both the current pin and every remote gate/image before allowing the
+coop recipe to prepare/start. Any new fetch/apply/gate invalidates the prior PASS
+first, so a failed requalification cannot fall back to stale success state.
+
+After Job 25 passes:
+
+```bash
+./scripts/30-recipe-run.sh dgx-c1 tp2 v41-exl3-vision-coop prepare
+./scripts/30-recipe-run.sh dgx-c1 tp2 v41-exl3-vision-coop start
+```
+
+To return to the stock path:
+
+```bash
+./scripts/30-recipe-run.sh dgx-c1 tp2 v41-exl3-vision-coop stop
+./scripts/30-recipe-run.sh dgx-c1 tp2 v41-exl3-vision start
+```
+
 ### Job 30 — recipe lifecycle on the topology head
 
 List registered recipes:
 
 ```bash
-./fleetctl.py recipe list
+./fleetctl recipe list
 ```
 
 Job 30 is **not** a model acquisition path. Before any lifecycle action it derives the selected recipe's pinned artifact manifest, inventories the selected topology nodes, and requires every model artifact to be positively identified as complete. If not, it stops and tells the operator to run Job 20.

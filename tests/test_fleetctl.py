@@ -520,5 +520,83 @@ class SimpleFleetTests(unittest.TestCase):
         self.assertEqual(env["DGX_V4_MODELS_HOST"],"/home/zbig/gguf/hf/deepseek-ai")
 
 
+    def test_runtime_reconcile_parser_accepts_job25_pipeline(self):
+        args=f.build_parser().parse_args([
+            "runtime-reconcile","--cluster","dgx-c1","--topology","tp2",
+            "--recipe","v41-exl3-vision-coop","--fetch","--apply","--gate"
+        ])
+        self.assertEqual(args.recipe,["v41-exl3-vision-coop"])
+        self.assertTrue(args.fetch and args.apply and args.gate)
+
+    def test_runtime_artifact_paths_are_content_addressed(self):
+        c=cfg2()
+        artifact={
+            "sha256":"9a9c44f0e423e3cfe595f195925e520af8e1b5bc56814fcaefccda87a4e983ae",
+            "stage":{
+                "host_template":"{home}/.cache/vllm-dsv41-flash-exl3/coop/{sha12}",
+                "container_template":"/root/.cache/vllm/coop/{sha12}",
+            },
+        }
+        host,container,host_mount,container_mount=f._runtime_artifact_dirs(c,artifact)
+        self.assertEqual(host,"/home/zbig/.cache/vllm-dsv41-flash-exl3/coop/9a9c44f0e423")
+        self.assertEqual(container,"/root/.cache/vllm/coop/9a9c44f0e423")
+        self.assertEqual(host_mount,"/home/zbig/.cache/vllm-dsv41-flash-exl3")
+        self.assertEqual(container_mount,"/root/.cache/vllm")
+
+    def test_runtime_activation_env_injects_overlay_and_pinned_image(self):
+        c=cfg2()
+        artifact={
+            "sha256":"9a9c44f0e423e3cfe595f195925e520af8e1b5bc56814fcaefccda87a4e983ae",
+            "stage":{
+                "host_template":"{home}/.cache/vllm-dsv41-flash-exl3/coop/{sha12}",
+                "container_template":"/root/.cache/vllm/coop/{sha12}",
+                "overlay_name":"exl3-cooperative.py",
+            },
+            "activation":{
+                "overlay_env":"DGX_COOP_OVERLAY_HOST",
+                "env":{"DGX_COOP_TEMP_ROWS_FUSED":"8","DGX_COOP_IMAGE":"image@sha256:abc"},
+            },
+        }
+        env=f._runtime_activation_env(c,artifact)
+        self.assertEqual(env["DGX_COOP_TEMP_ROWS_FUSED"],"8")
+        self.assertEqual(env["DGX_COOP_IMAGE"],"image@sha256:abc")
+        self.assertTrue(env["DGX_COOP_OVERLAY_HOST"].endswith("/9a9c44f0e423/exl3-cooperative.py"))
+
+    def test_coop_recipe_start_requires_all_rank_gate_state(self):
+        c=cfg2(); t={"name":"tp2","tp":2,"nodes":[1,2]}
+        recipe={"id":"v41-exl3-vision-coop","runtime_artifact_provider":"recipes/runtime_artifacts/v41_exl3_coop.py"}
+        manifest={"runtime_artifacts":[{
+            "id":"coop","kind":"native-library",
+            "sha256":"9a9c44f0e423e3cfe595f195925e520af8e1b5bc56814fcaefccda87a4e983ae"
+        }]}
+        with mock.patch.object(f,"_runtime_artifact_provider_manifest",return_value=manifest), \
+             mock.patch.object(f,"_load_runtime_state",return_value=None):
+            with self.assertRaises(SystemExit) as ctx:
+                f._recipe_runtime_artifacts_ready(c,"dgx-c1",t,recipe,required=True)
+        self.assertIn("25-runtime-reconcile.sh",str(ctx.exception))
+
+    def test_runtime_gate_command_uses_pinned_image_and_54_case_contract(self):
+        artifact={
+            "id":"coop",
+            "sha256":"9a9c44f0e423e3cfe595f195925e520af8e1b5bc56814fcaefccda87a4e983ae",
+            "runtime_py":{"sha256":"20c1bbf2663f61843c6c46de803bb134243c62799e3762ca3f5afe28c533491a"},
+            "stage":{"overlay_name":"exl3-cooperative.py"},
+            "image":{
+                "reference":"image@sha256:digest",
+                "digest":"sha256:digest",
+                "legacy_config_id":"sha256:imageid",
+            },
+            "gate":{"checks":54,"conflicting_containers":["dsv41-exl3-head"]},
+        }
+        cmd=f._runtime_gate_command(artifact,"/cache/coop","/cache","/root/.cache/vllm")
+        self.assertIn("image@sha256:digest",cmd)
+        self.assertIn("sha256:digest",cmd)
+        self.assertIn("sha256:imageid",cmd)
+        self.assertIn("unexpected image identity",cmd)
+        self.assertIn("test_cuda_integration.py",cmd)
+        self.assertIn("dsv41-exl3-head",cmd)
+        self.assertIn(" 54",cmd)
+
+
 
 if __name__ == "__main__": unittest.main()

@@ -353,6 +353,9 @@ def configure_mia_exl3(cluster, profile):
         ("DGX_ENGRAM_DIR", "ENGRAM_DIR"),
         ("DGX_WORKER_MODEL_DIR", "WORKER_MODEL_DIR"),
         ("DGX_WORKER_ENGRAM_DIR", "WORKER_ENGRAM_DIR"),
+        ("DGX_COOP_OVERLAY_HOST", "EXL3_OVERLAY_HOST"),
+        ("DGX_COOP_TEMP_ROWS_FUSED", "EXL3_TEMP_ROWS_FUSED"),
+        ("DGX_COOP_IMAGE", "IMAGE"),
     ):
         value = os.environ.get(env_name)
         if value:

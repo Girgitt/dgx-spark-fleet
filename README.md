@@ -20,6 +20,7 @@ work on the selected topology head and drives the remaining Sparks over SSH.
 | `v4-vision-vllm-tp2` | 2 Sparks | tonyd2wild V4 Vision recipe | V4 Flash Vision Exp, vLLM, DSpark, TP2 |
 | `v4-vision-vllm-tp4` | 4 Sparks | same | same model/runtime, TP4 |
 | `v41-vision-exl3-vllm-tp2` | 2 Sparks | MiaAI-Lab EXL3 recipe | V4.1 Vision, EXL3 2.9 bpw, vLLM, TP2 |
+| `v41-vision-exl3-vllm-tp2-local-coop` | 2 Sparks | MiaAI-Lab EXL3 + pinned external runtime artifact | opt-in cooperative-MoE lane; Job 25 qualification required |
 | `v41-vision-sglang-tp4` | 4 Sparks | MiaAI-Lab native recipe | V4.1 Vision, SGLang TP4; intended four-Spark destination |
 
 The submodules are pinned by this repository. `fleet.py sources update` deliberately does **not** silently bless new upstream code: review and commit the resulting gitlink changes yourself.
@@ -147,6 +148,31 @@ spark4  192.168.192.13/24
 A second confirmed RoCE plane can use `192.168.193.0/24`. No default route belongs on either fabric.
 
 For the MiaAI SGLang TP4 recipe, the current upstream `.env.tp4` contract assumes the same `FABRIC_IFACE` name on all four Sparks. `fleet.py` checks this and refuses to render a misleading configuration if the names differ.
+
+## Native runtime artifacts / Job 25
+
+Model weights remain a Job-20 concern. Optional native runtime extensions are
+reconciled separately so untracked/checksummed binaries are never smuggled through
+the recipe-source archive. The first registered runtime-artifact recipe is
+`v41-exl3-vision-coop`. It keeps the MiaAI-Lab source submodule pinned and
+unmodified, while Job 25 fetches the external cooperative-MoE artifact from its
+exact reviewed Git commit on the topology head, verifies the binary/runtime pins,
+stages identical content-addressed files on every rank, verifies the immutable
+container image, and runs the 54-case GPU integration gate on every rank.
+
+For TP2:
+
+```bash
+./scripts/25-runtime-reconcile.sh dgx-c1 tp2 \
+  --recipe v41-exl3-vision-coop --fetch --apply --gate
+```
+
+The GPU gate requires the DS4.1 EXL3 service to be stopped. A failed or interrupted
+requalification invalidates the previous PASS state. Job 30 refuses
+`prepare`/`start` for a runtime-artifact recipe unless the current artifact, image
+and per-node gate markers still match the pinned manifest.
+
+Rollback does not remove anything: start the stock `v41-exl3-vision` recipe instead.
 
 ## Profile workflow
 

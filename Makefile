@@ -8,4 +8,4 @@ sources:
 
 test:
 	./scripts/python.sh -m unittest discover -s tests -v
-	./scripts/python.sh -m py_compile fleet.py fleetctl.py scripts/smoke-openai.py recipes/artifacts/*.py
+	./scripts/python.sh -m py_compile fleet.py fleetctl.py scripts/smoke-openai.py recipes/artifacts/*.py recipes/runtime_artifacts/*.py

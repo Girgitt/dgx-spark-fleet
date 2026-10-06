@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timezone
 import ipaddress
 import json
 import os
@@ -1731,6 +1732,542 @@ def _recipe_runtime_env(cfg, profile, artifacts):
     return env
 
 
+
+def _runtime_artifact_provider_manifest(recipe):
+    raw = str(recipe.get("runtime_artifact_provider", "")).strip()
+    if not raw:
+        return {"recipe": recipe.get("id", ""), "runtime_artifacts": []}
+    source = _recipe_source_path(recipe)
+    provider = (ROOT / raw).resolve()
+    try:
+        provider.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise SystemExit(f"Recipe {recipe['id']}: runtime artifact provider escapes repository: {raw!r}") from exc
+    if not provider.exists():
+        raise SystemExit(f"Recipe {recipe['id']}: missing runtime artifact provider {provider}")
+    r = run(
+        [sys.executable, str(provider), "--source", str(source), "--recipe-id", recipe["id"]],
+        capture=True,
+        check=False,
+    )
+    if r.returncode:
+        detail = (r.stderr or r.stdout or "").strip()
+        raise SystemExit(
+            f"Recipe {recipe['id']}: runtime artifact provider failed"
+            + (f": {detail.splitlines()[-1]}" if detail else "")
+        )
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Recipe {recipe['id']}: runtime artifact provider returned invalid JSON: {exc}") from exc
+    artifacts = data.get("runtime_artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise SystemExit(f"Recipe {recipe['id']}: runtime artifact provider returned no runtime artifacts")
+    for artifact in artifacts:
+        if artifact.get("kind") != "native-library" or not re.fullmatch(
+            r"[0-9a-f]{64}", str(artifact.get("sha256", ""))
+        ):
+            raise SystemExit(f"Recipe {recipe['id']}: unsupported runtime artifact descriptor: {artifact}")
+    return data
+
+
+def selected_runtime_recipe_records(selectors):
+    requested = list(selectors or [])
+    explicit = bool(requested and requested != ["all"])
+    records = selected_recipe_records(requested)
+    runtime = []
+    missing = []
+    for record in records:
+        if record[1].get("runtime_artifact_provider"):
+            runtime.append(record)
+        elif explicit:
+            missing.append(record[1].get("id", "<unknown>"))
+    if missing:
+        raise SystemExit("Selected recipe(s) do not declare runtime artifacts: " + ", ".join(missing))
+    if not runtime:
+        raise SystemExit("No enabled recipes declare runtime artifacts")
+    return runtime
+
+
+def runtime_state_path(cluster_id, topology_name, recipe_id):
+    return STATE / cluster_id / "runtime" / topology_name / recipe_id / "state.json"
+
+
+def _load_runtime_state(cluster_id, topology_name, recipe_id):
+    path = runtime_state_path(cluster_id, topology_name, recipe_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def _write_runtime_state(cluster_id, topology_name, recipe_id, data):
+    path = runtime_state_path(cluster_id, topology_name, recipe_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def _runtime_artifact_dirs(cfg, artifact):
+    sha12 = artifact["sha256"][:12]
+    user = ssh_user(cfg)
+    home = f"/home/{user}"
+    stage = artifact.get("stage") or {}
+    host_tmpl = str(stage.get("host_template", "{home}/.cache/dgx-spark-fleet/runtime/{sha12}"))
+    container_tmpl = str(
+        stage.get("container_template", "/root/.cache/dgx-spark-fleet/runtime/{sha12}")
+    )
+    host = posixpath.normpath(host_tmpl.format(home=home, sha12=sha12))
+    container = posixpath.normpath(container_tmpl.format(home=home, sha12=sha12))
+    if host != home and not host.startswith(home.rstrip("/") + "/"):
+        raise SystemExit(f"Runtime artifact host path must stay under {home}: {host}")
+    if not container.startswith("/"):
+        raise SystemExit(f"Runtime artifact container path must be absolute: {container}")
+    host_mount_tmpl = str(
+        stage.get("host_mount_template", "{home}/.cache/vllm-dsv41-flash-exl3")
+    )
+    container_mount = str(stage.get("container_mount", "/root/.cache/vllm"))
+    host_mount = posixpath.normpath(host_mount_tmpl.format(home=home, sha12=sha12))
+    return host, container, host_mount, container_mount
+
+
+def _runtime_stage_verify_command(artifact, stage):
+    runtime = artifact.get("runtime_py") or {}
+    overlay = (artifact.get("stage") or {}).get("overlay_name", "exl3-cooperative.py")
+    checks = [
+        f"test -d {shlex.quote(stage)}",
+        f"cd {shlex.quote(stage)}",
+        f"printf '%s  cooperative_moe.so\\n' {shlex.quote(artifact['sha256'])} | sha256sum -c -",
+    ]
+    runtime_sha = runtime.get("sha256", "")
+    if runtime_sha:
+        checks.append(
+            f"printf '%s  runtime.py\\n' {shlex.quote(runtime_sha)} | sha256sum -c -"
+        )
+    checks += [f"test -s {shlex.quote(overlay)}", "sha256sum -c SHA256SUMS"]
+    return "set -euo pipefail; " + "; ".join(checks)
+
+
+def _runtime_stage_valid(cfg, idx, artifact):
+    stage, _, _, _ = _runtime_artifact_dirs(cfg, artifact)
+    result = ssh(
+        cfg,
+        idx,
+        _runtime_stage_verify_command(artifact, stage),
+        check=False,
+        capture=True,
+    )
+    return result.returncode == 0
+
+
+def _runtime_manifest_payload(artifact):
+    keep = {
+        "id": artifact.get("id"),
+        "kind": artifact.get("kind"),
+        "name": artifact.get("name"),
+        "sha256": artifact.get("sha256"),
+        "runtime_py": artifact.get("runtime_py"),
+        "source": artifact.get("source"),
+        "pins": artifact.get("pins"),
+        "image": artifact.get("image"),
+    }
+    return base64.b64encode(
+        (json.dumps(keep, sort_keys=True, indent=2) + "\n").encode()
+    ).decode()
+
+
+def _fetch_runtime_artifact_on_head(cfg, head, artifact):
+    source = artifact.get("source") or {}
+    if source.get("type") != "git":
+        raise SystemExit(f"Unsupported runtime artifact source: {source}")
+    repo = str(source.get("repo", ""))
+    ref = str(source.get("ref", ""))
+    if not repo.startswith("https://github.com/") or not re.fullmatch(r"[0-9a-f]{40}", ref):
+        raise SystemExit(f"Runtime artifact requires an exact GitHub commit pin: {source}")
+    stage, container, _, _ = _runtime_artifact_dirs(cfg, artifact)
+    overlay = (artifact.get("stage") or {}).get("overlay_name", "exl3-cooperative.py")
+    binary_path = source["binary_path"]
+    runtime_path = source["runtime_path"]
+    generator_path = source["generator_path"]
+    stock_path = source["stock_path"]
+    gate_path = source["gate_path"]
+    support_path = source["gate_support_path"]
+    provenance_path = source.get("provenance_path", "")
+    manifest64 = _runtime_manifest_payload(artifact)
+    runtime_sha = (artifact.get("runtime_py") or {}).get("sha256", "")
+    files = [
+        "cooperative_moe.so",
+        "runtime.py",
+        overlay,
+        "prepare_profile.py",
+        "test_cuda_integration.py",
+        "test_exl3_overlay.py",
+    ]
+    if provenance_path:
+        files.append("cooperative_moe-build.log")
+    sums = " ".join(shlex.quote(item) for item in files)
+    provenance_install = (
+        f'install -m 0644 "$CHECKOUT/{provenance_path}" "$TMP/cooperative_moe-build.log"; '
+        if provenance_path
+        else ""
+    )
+    script = f'''set -euo pipefail
+STAGE={shlex.quote(stage)}
+TMP="${{STAGE}}.tmp.$$"
+CHECKOUT="$(mktemp -d /tmp/dgx-runtime-source.XXXXXX)"
+cleanup() {{ rm -rf "$TMP" "$CHECKOUT"; }}
+trap cleanup EXIT
+rm -rf "$TMP"; mkdir -p "$TMP"
+git init -q "$CHECKOUT"
+git -C "$CHECKOUT" remote add origin {shlex.quote(repo)}
+git -C "$CHECKOUT" fetch -q --depth=1 origin {shlex.quote(ref)}
+git -C "$CHECKOUT" checkout -q --detach FETCH_HEAD
+test "$(git -C "$CHECKOUT" rev-parse HEAD)" = {shlex.quote(ref)}
+install -m 0644 "$CHECKOUT/{binary_path}" "$TMP/cooperative_moe.so"
+install -m 0644 "$CHECKOUT/{runtime_path}" "$TMP/runtime.py"
+printf '%s  cooperative_moe.so\n' {shlex.quote(artifact['sha256'])} | (cd "$TMP" && sha256sum -c -)
+printf '%s  runtime.py\n' {shlex.quote(runtime_sha)} | (cd "$TMP" && sha256sum -c -)
+python3 "$CHECKOUT/{generator_path}" --stock "$CHECKOUT/{stock_path}" --artifacts "$TMP" --runtime-directory {shlex.quote(container)} --output "$TMP/{overlay}"
+install -m 0644 "$CHECKOUT/{generator_path}" "$TMP/prepare_profile.py"
+install -m 0644 "$CHECKOUT/{gate_path}" "$TMP/test_cuda_integration.py"
+install -m 0644 "$CHECKOUT/{support_path}" "$TMP/test_exl3_overlay.py"
+{provenance_install}printf '%s' {shlex.quote(manifest64)} | base64 -d > "$TMP/manifest.json"
+(cd "$TMP" && sha256sum {sums} > SHA256SUMS && sha256sum -c SHA256SUMS)
+rm -rf "$STAGE"; mkdir -p "$(dirname "$STAGE")"; mv "$TMP" "$STAGE"
+trap - EXIT; rm -rf "$CHECKOUT"
+'''
+    print(f"\n== runtime fetch on node{head}: {artifact['id']} @ {ref[:12]} ==")
+    result = ssh(cfg, head, script, check=False)
+    if result.returncode:
+        raise SystemExit(f"Runtime artifact fetch/stage failed on node{head}: {artifact['id']}")
+    if not _runtime_stage_valid(cfg, head, artifact):
+        raise SystemExit(f"node{head}: staged runtime artifact failed post-fetch verification")
+
+
+def _sync_runtime_artifact(cfg, head, dst, artifact):
+    stage, _, _, _ = _runtime_artifact_dirs(cfg, artifact)
+    dest = f"{ssh_user(cfg)}@{con_name(cfg, dst)}"
+    command = (
+        "set -euo pipefail; "
+        f"ssh -o BatchMode=yes -o ConnectTimeout=7 {shlex.quote(dest)} "
+        f"'rm -rf {shlex.quote(stage)} && mkdir -p {shlex.quote(stage)}'; "
+        f"rsync -aH --partial --info=progress2 {shlex.quote(stage.rstrip('/') + '/')} "
+        f"{shlex.quote(dest + ':' + stage.rstrip('/') + '/')}"
+    )
+    print(f"\n== runtime artifact sync node{head} -> node{dst} over {con_name(cfg, dst)} ==")
+    result = ssh(cfg, head, command, check=False)
+    if result.returncode or not _runtime_stage_valid(cfg, dst, artifact):
+        raise SystemExit(f"Runtime artifact sync/verification failed node{head} -> node{dst}")
+
+
+def _runtime_image_verify_command(image, *, pull):
+    image_ref = str(image.get("reference", "")).strip()
+    digest = str(image.get("digest", "")).strip()
+    legacy_config_id = str(image.get("legacy_config_id", "")).strip()
+    if not image_ref or not digest or not image_ref.endswith("@" + digest):
+        raise SystemExit("Runtime artifact image metadata must use an immutable reference@digest")
+    pull_cmd = (
+        'if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then docker pull "$IMAGE"; fi'
+        if pull
+        else 'docker image inspect "$IMAGE" >/dev/null 2>&1'
+    )
+    legacy_check = (
+        f' && [ "$ACTUAL_ID" != {shlex.quote(legacy_config_id)} ]'
+        if legacy_config_id
+        else ""
+    )
+    return f'''IMAGE={shlex.quote(image_ref)}
+EXPECTED_DIGEST={shlex.quote(digest)}
+{pull_cmd}
+ACTUAL_ID="$(docker image inspect -f '{{{{.Id}}}}' "$IMAGE")"
+if [ "$ACTUAL_ID" != "$EXPECTED_DIGEST" ]{legacy_check}; then
+  echo "unexpected image identity: $ACTUAL_ID (expected target digest $EXPECTED_DIGEST or legacy config id {legacy_config_id or '<none>'})" >&2
+  exit 43
+fi'''
+
+
+def _runtime_gate_command(artifact, stage, host_mount, container_mount):
+    image = artifact.get("image") or {}
+    gate = artifact.get("gate") or {}
+    checks = int(gate.get("checks", 0))
+    overlay = (artifact.get("stage") or {}).get("overlay_name", "exl3-cooperative.py")
+    if checks < 1:
+        raise SystemExit(f"Runtime artifact gate metadata is incomplete: {artifact.get('id')}")
+    image_verify = _runtime_image_verify_command(image, pull=True)
+    conflict = "; ".join(
+        f"if docker ps --format '{{{{.Names}}}}' | grep -Fxq {shlex.quote(name)}; "
+        f"then echo 'ERROR: stop {name} before runtime gate' >&2; exit 42; fi"
+        for name in gate.get("conflicting_containers", [])
+    )
+    parser = (
+        "import json,sys; final=None\n"
+        "for line in open(sys.argv[1], errors='replace'):\n"
+        " try: obj=json.loads(line)\n"
+        " except Exception: continue\n"
+        " if obj.get('stage')=='complete': final=obj\n"
+        "expected=int(sys.argv[2])\n"
+        "assert final and final.get('status')=='pass' and int(final.get('checks',-1))==expected, final"
+    )
+    log = f"{stage}/gate.log"
+    return f'''set -euo pipefail
+{_runtime_stage_verify_command(artifact, stage)}
+{conflict}
+{image_verify}
+set +e
+docker run --rm --network none --gpus all --cpus 2 --memory 6g --memory-swap 6g \\
+  -e DSV41_COOP_MAINTENANCE_TEST=1 -e MAX_JOBS=2 -e OMP_NUM_THREADS=1 \\
+  -e OPENBLAS_NUM_THREADS=1 -e PYTHONDONTWRITEBYTECODE=1 \\
+  -v {shlex.quote(host_mount + ':' + container_mount)} \\
+  -v {shlex.quote(stage + '/' + overlay + ':/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/exl3.py:ro')} \\
+  -v {shlex.quote(stage + '/test_exl3_overlay.py:/opt/dsv41/test_exl3_overlay.py:ro')} \\
+  -v {shlex.quote(stage + '/test_cuda_integration.py:/opt/dsv41/test_cuda_integration.py:ro')} \\
+  --entrypoint python3 "$IMAGE" /opt/dsv41/test_cuda_integration.py 2>&1 | tee {shlex.quote(log)}
+RC=${{PIPESTATUS[0]}}
+set -e
+test "$RC" -eq 0
+python3 -c {shlex.quote(parser)} {shlex.quote(log)} {checks}
+'''
+
+
+def _run_runtime_gate(cfg, idx, artifact):
+    stage, _, host_mount, container_mount = _runtime_artifact_dirs(cfg, artifact)
+    print(f"\n== runtime GPU gate node{idx}: {artifact['id']} ==")
+    result = ssh(
+        cfg,
+        idx,
+        _runtime_gate_command(artifact, stage, host_mount, container_mount),
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(f"Runtime GPU gate failed on node{idx}: {artifact['id']}")
+    image = artifact["image"]
+    observed = ssh(
+        cfg,
+        idx,
+        f"docker image inspect -f '{{{{.Id}}}}' {shlex.quote(image['reference'])}",
+        capture=True,
+    ).stdout.strip()
+    gate_doc = {
+        "version": 1,
+        "node_index": int(idx),
+        "artifact_id": artifact["id"],
+        "artifact_sha256": artifact["sha256"],
+        "image_reference": image["reference"],
+        "image_digest": image["digest"],
+        "image_legacy_config_id": image.get("legacy_config_id", ""),
+        "observed_image_id": observed,
+        "checks": int((artifact.get("gate") or {}).get("checks", 0)),
+        "status": "pass",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    payload = base64.b64encode(
+        (json.dumps(gate_doc, sort_keys=True, indent=2) + "\n").encode()
+    ).decode()
+    ssh(
+        cfg,
+        idx,
+        f"printf '%s' {shlex.quote(payload)} | base64 -d > {shlex.quote(stage + '/gate.json')}",
+    )
+
+
+def _runtime_gate_valid(cfg, idx, artifact):
+    stage, _, _, _ = _runtime_artifact_dirs(cfg, artifact)
+    image = artifact.get("image") or {}
+    expected = {
+        "artifact_sha256": artifact["sha256"],
+        "image_reference": image.get("reference"),
+        "image_digest": image.get("digest"),
+        "image_legacy_config_id": image.get("legacy_config_id", ""),
+        "checks": int((artifact.get("gate") or {}).get("checks", 0)),
+        "status": "pass",
+        "node_index": int(idx),
+    }
+    expected64 = base64.b64encode(json.dumps(expected, sort_keys=True).encode()).decode()
+    parser = (
+        "import base64,json,sys; a=json.load(open(sys.argv[1])); "
+        "e=json.loads(base64.b64decode(sys.argv[2])); "
+        "assert all(a.get(k)==v for k,v in e.items()), (a,e)"
+    )
+    verify = _runtime_stage_verify_command(artifact, stage)
+    image_verify = _runtime_image_verify_command(image, pull=False)
+    cmd = (
+        f"{verify}; python3 -c {shlex.quote(parser)} {shlex.quote(stage + '/gate.json')} {shlex.quote(expected64)}; "
+        f"{image_verify}"
+    )
+    return ssh(cfg, idx, cmd, check=False, capture=True).returncode == 0
+
+
+def _runtime_activation_env(cfg, artifact):
+    stage, _, _, _ = _runtime_artifact_dirs(cfg, artifact)
+    activation = artifact.get("activation") or {}
+    env = {str(k): str(v) for k, v in (activation.get("env") or {}).items()}
+    overlay_env = str(activation.get("overlay_env", "")).strip()
+    if overlay_env:
+        overlay = (artifact.get("stage") or {}).get("overlay_name", "exl3-cooperative.py")
+        env[overlay_env] = posixpath.join(stage, overlay)
+    return env
+
+
+def _recipe_runtime_artifacts_ready(cfg, cluster_id, t, recipe, *, required):
+    if not recipe.get("runtime_artifact_provider"):
+        return [], {}
+    manifest = _runtime_artifact_provider_manifest(recipe)
+    artifacts = [dict(item) for item in manifest["runtime_artifacts"]]
+    state = _load_runtime_state(cluster_id, t["name"], recipe["id"])
+    valid_state = bool(
+        state
+        and state.get("version") == 1
+        and state.get("cluster") == cluster_id
+        and state.get("topology") == t["name"]
+        and state.get("recipe") == recipe["id"]
+        and state.get("nodes") == [int(x) for x in t["nodes"]]
+        and state.get("gate_status") == "pass"
+    )
+    remote_ok = valid_state
+    if remote_ok:
+        for artifact in artifacts:
+            for idx in t["nodes"]:
+                if not _runtime_gate_valid(cfg, idx, artifact):
+                    remote_ok = False
+                    break
+            if not remote_ok:
+                break
+    if not remote_ok:
+        if required:
+            raise SystemExit(
+                "Recipe runtime prerequisites are not staged and GPU-gated on every topology node. "
+                f"Run: ./scripts/25-runtime-reconcile.sh {cluster_id} {t['name']} "
+                f"--recipe {recipe['id']} --fetch --apply --gate"
+            )
+        return artifacts, {}
+    env = {}
+    for artifact in artifacts:
+        env.update(_runtime_activation_env(cfg, artifact))
+    return artifacts, env
+
+
+def cmd_runtime_reconcile(args):
+    cfg, _ = load_cfg(args.cluster)
+    t = resolve_topology_arg(cfg, args.cluster, args.topology)
+    records = selected_runtime_recipe_records(args.recipe)
+    ensure_recipe_sources(records)
+    head = int(t["nodes"][0])
+    for _, recipe in records:
+        if t["tp"] not in [int(x) for x in recipe.get("supported_tp", [])]:
+            raise SystemExit(f"Recipe {recipe['id']} does not support tp={t['tp']}")
+        manifest = _runtime_artifact_provider_manifest(recipe)
+        artifacts = [dict(item) for item in manifest["runtime_artifacts"]]
+        print(f"\nRUNTIME RECIPE: {recipe['id']} topology={t['name']} nodes={t['nodes']}")
+        for artifact in artifacts:
+            stage, container, _, _ = _runtime_artifact_dirs(cfg, artifact)
+            print(f"  {artifact['id']}: sha256={artifact['sha256']}")
+            print(f"    host:      {stage}")
+            print(f"    container: {container}")
+            print(
+                f"    source:    {(artifact.get('source') or {}).get('repo')}@"
+                f"{(artifact.get('source') or {}).get('ref')}"
+            )
+            print(f"    image:     {(artifact.get('image') or {}).get('reference')}")
+        if not (args.fetch or args.apply or args.gate):
+            state = _load_runtime_state(args.cluster, t["name"], recipe["id"])
+            print(
+                "  state:",
+                "qualified" if state and state.get("gate_status") == "pass" else "not qualified",
+            )
+            continue
+        # Invalidate previous qualification before any mutation/requalification.
+        # A failed fetch/apply/gate must never leave an older PASS usable by Job 30.
+        _write_runtime_state(
+            args.cluster,
+            t["name"],
+            recipe["id"],
+            {
+                "version": 1,
+                "cluster": args.cluster,
+                "topology": t["name"],
+                "recipe": recipe["id"],
+                "nodes": [int(x) for x in t["nodes"]],
+                "artifacts": [],
+                "gate_status": "pending",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        if args.fetch:
+            for artifact in artifacts:
+                _fetch_runtime_artifact_on_head(cfg, head, artifact)
+        if args.apply:
+            for artifact in artifacts:
+                if not _runtime_stage_valid(cfg, head, artifact):
+                    raise SystemExit(
+                        f"Head node{head} has no verified runtime artifact; rerun with --fetch --apply"
+                    )
+                stage, _, _, _ = _runtime_artifact_dirs(cfg, artifact)
+                ssh(
+                    cfg,
+                    head,
+                    f"rm -f {shlex.quote(stage + '/gate.json')} {shlex.quote(stage + '/gate.log')}",
+                )
+                for idx in t["nodes"]:
+                    if int(idx) == head:
+                        continue
+                    _sync_runtime_artifact(cfg, head, int(idx), artifact)
+        staged = {}
+        for artifact in artifacts:
+            staged[artifact["id"]] = [
+                int(idx)
+                for idx in t["nodes"]
+                if _runtime_stage_valid(cfg, int(idx), artifact)
+            ]
+        gate_status = "pending"
+        if args.gate:
+            for artifact in artifacts:
+                missing = [
+                    int(idx)
+                    for idx in t["nodes"]
+                    if int(idx) not in staged[artifact["id"]]
+                ]
+                if missing:
+                    raise SystemExit(
+                        f"Runtime artifact {artifact['id']} is not staged on nodes {missing}; "
+                        "use --fetch --apply first"
+                    )
+                stage, _, _, _ = _runtime_artifact_dirs(cfg, artifact)
+                for idx in t["nodes"]:
+                    ssh(
+                        cfg,
+                        int(idx),
+                        f"rm -f {shlex.quote(stage + '/gate.json')} {shlex.quote(stage + '/gate.log')}",
+                    )
+                for idx in t["nodes"]:
+                    _run_runtime_gate(cfg, int(idx), artifact)
+            gate_status = "pass"
+        state = {
+            "version": 1,
+            "cluster": args.cluster,
+            "topology": t["name"],
+            "recipe": recipe["id"],
+            "nodes": [int(x) for x in t["nodes"]],
+            "artifacts": [
+                {
+                    "id": artifact["id"],
+                    "sha256": artifact["sha256"],
+                    "staged_nodes": staged[artifact["id"]],
+                }
+                for artifact in artifacts
+            ],
+            "gate_status": gate_status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_runtime_state(args.cluster, t["name"], recipe["id"], state)
+        if gate_status == "pass":
+            print(f"RUNTIME RECONCILE OK: {recipe['id']} qualified on nodes {t['nodes']}")
+        else:
+            print(f"RUNTIME RECONCILE STAGED: {recipe['id']} (GPU gate pending)")
+
+
 def _git_head(path):
     r=run(["git","-C",str(path),"rev-parse","HEAD"],capture=True,check=False)
     value=(r.stdout or "").strip()
@@ -1822,6 +2359,10 @@ def cmd_recipe(args):
     ensure_recipe_sources(records)
     artifacts=_recipe_artifacts_ready(cfg,args.cluster,t,recipe)
     runtime_env=_recipe_runtime_env(cfg,profile,artifacts)
+    _, native_runtime_env=_recipe_runtime_artifacts_ready(
+        cfg,args.cluster,t,recipe,required=args.operation in ("prepare","start")
+    )
+    runtime_env.update(native_runtime_env)
     compat=generate_legacy_config(cfg,args.cluster,t)
 
     print(f"RECIPE: {recipe['id']} topology={t['name']} tp={t['tp']} nodes={t['nodes']}")
@@ -1871,6 +2412,14 @@ def build_parser():
     q.add_argument("--download-missing",action="store_true",help="permit Internet downloads on a Spark seed (requires --apply)")
     q.add_argument("--seed-node",type=int,help="override automatic download seed for missing artifacts")
     q.set_defaults(func=cmd_model_reconcile)
+    q=sub.add_parser("runtime-reconcile", help="reconcile pinned native runtime artifacts and run their GPU qualification gates")
+    q.add_argument("--cluster",required=True)
+    q.add_argument("--topology",help="topology to qualify; defaults to the active topology")
+    q.add_argument("--recipe",action="append",default=[],help="runtime-artifact recipe id; repeatable; default: all enabled recipes that declare runtime artifacts")
+    q.add_argument("--fetch",action="store_true",help="fetch the exact external source pin on the topology head and stage the verified artifact there")
+    q.add_argument("--apply",action="store_true",help="replicate the staged artifact from the head to every topology node over the fabric")
+    q.add_argument("--gate",action="store_true",help="pull/verify the pinned image and run the GPU integration gate on every topology node")
+    q.set_defaults(func=cmd_runtime_reconcile)
     q=sub.add_parser("recipe"); q.add_argument("action",choices=["list","run"]); q.add_argument("recipe",nargs="?"); q.add_argument("operation",nargs="?",choices=["prepare","start","stop","status","smoke"]); q.add_argument("--cluster"); q.add_argument("--topology"); q.set_defaults(func=cmd_recipe)
     return p
 

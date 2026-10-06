@@ -19,6 +19,7 @@ class DevelopmentEnvironmentContractTests(unittest.TestCase):
             "scripts/10-topology-select.sh",
             "scripts/20-model-reconcile.sh",
             "scripts/20-model-sync.sh",
+            "scripts/25-runtime-reconcile.sh",
             "scripts/30-recipe-run.sh",
         ]:
             text = (ROOT / rel).read_text()
