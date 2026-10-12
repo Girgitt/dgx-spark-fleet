@@ -193,5 +193,76 @@ class FleetTests(unittest.TestCase):
 
 
 
+    def test_reconciled_exl3_builds_slim_engram_view_with_skip_sync(self):
+        import json
+        import shutil
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            source = td / "native"
+            source.mkdir()
+            (source / "config.json").write_text('{"architectures": ["DeepseekV41ForCausalLM"]}')
+            index = {"weight_map": {
+                "model.layers.1.engram.embed.weight": "model-00047-of-00048.safetensors",
+                "model.layers.14.engram.embed.scale": "model-00048-of-00048.safetensors",
+                "model.layers.0.mlp.experts.weight": "model-00001-of-00048.safetensors",
+            }}
+            (source / "model.safetensors.index.json").write_text(json.dumps(index))
+            for name in ("model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"):
+                (source / name).write_bytes(b"placeholder-shard")
+            upstream = td / "sources" / "exl3"
+            (upstream / "scripts").mkdir(parents=True)
+            shutil.copy2(
+                ROOT / "sources/v41-exl3-vllm/scripts/prepare_engram_src.py",
+                upstream / "scripts/prepare_engram_src.py",
+            )
+            slim = td / "cache" / "engram-src"
+            profile = {"adapter": "mia_exl3", "env": {
+                "SKIP_SYNC": "1", "ENGRAM_SRC": str(slim),
+            }}
+            env = {"DGX_RECONCILED_MODELS": "1", "DGX_ENGRAM_DIR": str(source)}
+            with mock.patch.dict(os.environ, env):
+                fleet.prepare_reconciled_exl3_engram(profile, upstream)
+            self.assertEqual(
+                sorted(json.loads((slim / "model.safetensors.index.json").read_text())["weight_map"]),
+                ["model.layers.1.engram.embed.weight", "model.layers.14.engram.embed.scale"],
+            )
+            self.assertEqual((slim / "config.json").read_bytes(), (source / "config.json").read_bytes())
+            self.assertEqual(
+                (slim / "model-00047-of-00048.safetensors").stat().st_ino,
+                (source / "model-00047-of-00048.safetensors").stat().st_ino,
+            )
+            # A second prepare (or start) must be idempotent.
+            with mock.patch.dict(os.environ, env):
+                fleet.prepare_reconciled_exl3_engram(profile, upstream)
+
+    def test_reconciled_exl3_rejects_overwriting_native_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = {"DGX_RECONCILED_MODELS": "1", "DGX_ENGRAM_DIR": td}
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaisesRegex(SystemExit, "must differ"):
+                    fleet.reconciled_exl3_engram_paths({"env": {"ENGRAM_SRC": td}})
+
+    def test_exl3_start_prepares_slim_view_before_upstream_start(self):
+        events = []
+        profile = {"adapter": "mia_exl3"}
+        with mock.patch.object(fleet, "configure_profile", side_effect=lambda *a: events.append("configure")):
+            with mock.patch.object(fleet, "ensure_source", return_value=Path("/tmp/src")):
+                with mock.patch.object(fleet, "prepare_reconciled_exl3_engram", side_effect=lambda *a: events.append("slim")):
+                    with mock.patch.object(fleet, "run", side_effect=lambda *a, **kw: events.append("start")):
+                        fleet.start_profile({}, profile)
+        self.assertEqual(events, ["configure", "slim", "start"])
+
+    def test_exl3_prepare_stages_slim_even_when_download_skipped(self):
+        events = []
+        profile = {"adapter": "mia_exl3"}
+        with mock.patch.dict(os.environ, {"DGX_RECONCILED_MODELS": "1"}):
+            with mock.patch.object(fleet, "configure_profile", side_effect=lambda *a: events.append("configure")):
+                with mock.patch.object(fleet, "ensure_source", return_value=Path("/tmp/src")):
+                    with mock.patch.object(fleet, "prepare_reconciled_exl3_engram", side_effect=lambda *a: events.append("slim")):
+                        with mock.patch.object(fleet, "run", side_effect=lambda *a, **kw: events.append("download")):
+                            fleet.prepare_profile({}, profile)
+        self.assertEqual(events, ["configure", "slim"])
+
+
 if __name__ == "__main__":
     unittest.main()

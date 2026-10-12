@@ -319,6 +319,60 @@ def common_management_iface(cluster):
     return cluster["cluster"].get("management_interface", "")
 
 
+def reconciled_exl3_engram_paths(profile):
+    """Source and slim head bind path for Job-20-managed EXL3 deployments.
+
+    The upstream launcher binds ENGRAM_SRC to /engram-src, not ENGRAM_DIR.
+    Its SKIP_SYNC=1 shortcut also skips prepare_engram_src_dir(), so Job 30
+    must materialize the slim view independently of inter-node transfer.
+    """
+    source = os.environ.get("DGX_ENGRAM_DIR", "")
+    if not source or not Path(source).is_absolute():
+        raise SystemExit("Job 30 EXL3 requires an absolute DGX_ENGRAM_DIR from Job 20")
+    env = profile.get("env", {})
+    cache_root = str(env.get("CACHE_ROOT", Path.home() / ".cache/vllm-dsv41-flash-exl3"))
+    target = str(env.get("ENGRAM_SRC", Path(cache_root) / "engram-src"))
+    target_path = Path(target).expanduser()
+    if not target_path.is_absolute():
+        raise SystemExit("EXL3 ENGRAM_SRC must be an absolute node-local path")
+    source_path = Path(source)
+    if source_path.resolve() == target_path.resolve():
+        raise SystemExit("EXL3 ENGRAM_SRC must differ from canonical ENGRAM_DIR")
+    return source_path, target_path
+
+
+def prepare_reconciled_exl3_engram(profile, src):
+    """Build the validated slim head view even when upstream SKIP_SYNC=1."""
+    if os.environ.get("DGX_RECONCILED_MODELS") != "1":
+        return
+    source, slim = reconciled_exl3_engram_paths(profile)
+    # A previous Docker -v bind of an absent directory can create the host
+    # path owned by root.  Fail clearly instead of attempting a privileged
+    # copy or silently redirecting writes through a symlink.
+    if slim.is_symlink() or (slim.exists() and not slim.is_dir()):
+        raise SystemExit(f"Refusing unsafe EXL3 slim Engram destination: {slim}")
+    if slim.exists() and not os.access(slim, os.W_OK):
+        raise SystemExit(
+            f"EXL3 slim Engram directory is not writable: {slim} "
+            "(an earlier Docker -v mount may have created it as root; "
+            "inspect ownership and correct this directory only)"
+        )
+    builder = src / "scripts/prepare_engram_src.py"
+    if not builder.is_file():
+        raise SystemExit(f"Pinned EXL3 source missing Engram slim builder: {builder}")
+    run(["python3", str(builder), "--src", str(source), "--dst", str(slim)], cwd=src)
+    required = (
+        "config.json",
+        "model.safetensors.index.json",
+        "model-00047-of-00048.safetensors",
+        "model-00048-of-00048.safetensors",
+    )
+    missing = [name for name in required if not (slim / name).is_file()]
+    if missing:
+        raise SystemExit(f"EXL3 slim Engram staging incomplete at {slim}: {missing}")
+    print(f"Job 30 slim Engram ready: {source} -> {slim}")
+
+
 def configure_mia_exl3(cluster, profile):
     src = ensure_source(profile)
     nodes = topo_nodes(cluster, profile)
@@ -363,6 +417,11 @@ def configure_mia_exl3(cluster, profile):
     if os.environ.get("DGX_RECONCILED_MODELS") == "1":
         overrides["AUTO_DOWNLOAD"] = "0"
     overrides.update({k: str(v) for k, v in profile.get("env", {}).items()})
+    if os.environ.get("DGX_RECONCILED_MODELS") == "1":
+        # Keep upstream start.sh's container bind source identical to the
+        # Job-30-prepared slim directory, including custom CACHE_ROOT values.
+        _, slim = reconciled_exl3_engram_paths(profile)
+        overrides["ENGRAM_SRC"] = str(slim)
     merge_env(example, target, overrides)
     print(f"Wrote {target.relative_to(ROOT)}")
     return target
@@ -530,6 +589,7 @@ def prepare_profile(cluster, profile):
         return
     if adapter == "mia_exl3":
         if os.environ.get("DGX_RECONCILED_MODELS") == "1":
+            prepare_reconciled_exl3_engram(profile, src)
             print("Model artifacts already reconciled by Job 20; skipping upstream download.sh")
         else:
             run(["./download.sh"], cwd=src)
@@ -546,6 +606,8 @@ def start_profile(cluster, profile):
     src = ensure_source(profile)
     adapter = profile["adapter"]
     if adapter == "mia_exl3":
+        # start must be safe even if the operator skipped the prepare action.
+        prepare_reconciled_exl3_engram(profile, src)
         run(["./start.sh"], cwd=src)
     elif adapter == "mia_sglang_tp4":
         run(["./start-tp4.sh", "serve"], cwd=src)
