@@ -532,6 +532,183 @@ class SimpleFleetTests(unittest.TestCase):
         self.assertEqual(native_plan["candidates"],[])
         self.assertEqual(f._choose_download_seed(native_plan),1)
 
+    def test_unrelated_vision_checkpoint_does_not_block_engrams_subset_sync(self):
+        """dgx-c2: V4 Vision has the four files but is NOT native V4.1."""
+        cfg=cfg2()
+        base="/home/zbig/gguf/hf/"
+        exl3_path=base+"Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw"
+        native_path=base+"deepseek-ai/DeepSeek-V4.1-Flash"
+        vision_path=base+"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+        subset=["config.json", "model.safetensors.index.json",
+                "model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"]
+        exl3={"kind":"huggingface","format":"safetensors-directory",
+              "repo":"Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw",
+              "mode":"full","expected_shards":39,
+              "legacy_names":["DeepSeek-V4.1-Flash-EXL3-2.9bpw"]}
+        native={"kind":"huggingface","format":"safetensors-directory",
+                "repo":"deepseek-ai/DeepSeek-V4.1-Flash",
+                "mode":"subset","files":subset,
+                "legacy_names":["DeepSeek-V4.1-Flash"]}
+        def entry(path, files, shards, *, hints=None):
+            return {"path":path,"type":"directory","basename":path.rsplit("/",1)[-1],
+                    "files":files,"config":{},"repo_hints":hints or [],"hf_commits":[],
+                    "has_config":True,"has_index":True,
+                    "index_expected":shards,"index_present":shards,
+                    "safetensors":shards,"model_shards":shards,"ggufs":0,
+                    "weights":shards,"bytes":1234}
+        exl3_tree=entry(exl3_path,["config.json"],39)
+        native_tree=entry(native_path,subset,48)
+        # V4 Vision contains the four commonly named files, but no native
+        # V4.1 repository identity and no canonical/legacy name match.
+        vision_tree=entry(vision_path,subset,48)
+        solo=f.classify_artifact_from_inventory(cfg,native,[vision_tree])
+        self.assertEqual(solo["state"],"missing")
+        self.assertEqual(solo["path"],native_path)
+        plan,inventory=f.build_reconcile_plan(cfg,[exl3,native],{
+            1:[exl3_tree,native_tree,vision_tree],
+            2:[vision_tree],
+        })
+        self.assertEqual(plan[0]["probes"][2]["state"],"missing")
+        self.assertEqual(plan[1]["probes"][2]["state"],"missing")
+        self.assertEqual(plan[1]["probes"][2]["path"],native_path)
+        self.assertEqual(plan[1]["source"],1)
+        self.assertFalse(plan[1]["candidates"])
+        # Inventory retains foreign models as UNMATCHED, not delete targets.
+        self.assertEqual(inventory[2][0]["path"],vision_path)
+
+    def test_subset_metadata_alone_cannot_create_a_candidate(self):
+        cfg=cfg2()
+        native={"kind":"huggingface","repo":"deepseek-ai/DeepSeek-V4.1-Flash",
+                "mode":"subset","files":["config.json","model.safetensors.index.json"]}
+        other={"path":"/home/zbig/gguf/hf/org/completely-different-model",
+               "basename":"completely-different-model","type":"directory",
+               "files":["config.json","model.safetensors.index.json"],
+               "has_config":True,"has_index":True,"index_expected":0,"index_present":0,
+               "config":{},"repo_hints":[],"hf_commits":[],
+               "safetensors":0,"model_shards":0,"weights":0,"ggufs":0,"bytes":10}
+        self.assertEqual(f.classify_artifact_from_inventory(cfg,native,[other])["state"],
+                         "missing")
+        # Independent identity evidence still supports a review-only candidate
+        # for a noncanonical derived model, protecting the existing guard.
+        other["repo_hints"]=[native["repo"]]
+        self.assertEqual(f.classify_artifact_from_inventory(cfg,native,[other])["state"],
+                         "candidate")
+
+    def test_derived_exl3_subset_cannot_be_partial_or_complete_native(self):
+        """Regression: an Engram subset must never be rsynced into EXL3."""
+        cfg=cfg2()
+        base="/home/zbig/gguf/hf/"
+        exl3_path=base+"Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw"
+        native_path=base+"deepseek-ai/DeepSeek-V4.1-Flash"
+        shard_a="model-00047-of-00048.safetensors"
+        shard_b="model-00048-of-00048.safetensors"
+        files=["config.json","model.safetensors.index.json",shard_a,shard_b]
+        exl3={
+            "kind":"huggingface","format":"safetensors-directory",
+            "repo":"Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw",
+            "revision":"","mode":"full","expected_shards":39,
+            "legacy_names":["DeepSeek-V4.1-Flash-EXL3-2.9bpw"],"recipes":["coop"],
+        }
+        native={
+            "kind":"huggingface","format":"safetensors-directory",
+            "repo":"deepseek-ai/DeepSeek-V4.1-Flash", "revision":"",
+            "mode":"subset","files":files,
+            "legacy_names":["DeepSeek-V4.1-Flash"],"recipes":["coop"],
+        }
+        def entry(path, names, shards, *, index_expected=0, index_present=0):
+            return {"path":path,"type":"directory","basename":path.rsplit('/',1)[-1],
+                "files":names,"config":{},"repo_hints":["deepseek-ai/DeepSeek-V4.1-Flash"],
+                "hf_commits":[],"has_config":True,"has_index":True,
+                "index_expected":index_expected,"index_present":index_present,
+                "safetensors":shards,"model_shards":shards,"ggufs":0,"weights":shards,
+                "bytes":1234}
+        # Pre-accident: EXL3 contains just 2/4 shared subset metadata files.
+        exl3_clean=entry(exl3_path,files[:2],39,index_expected=39,index_present=39)
+        source_native=entry(native_path,files,48,index_expected=48,index_present=48)
+        plan,_=f.build_reconcile_plan(cfg,[exl3,native],{1:[exl3_clean,source_native],2:[exl3_clean]})
+        self.assertEqual(plan[1]["probes"][2]["state"],"missing")
+        self.assertEqual(plan[1]["probes"][2]["path"],native_path)
+        self.assertEqual(plan[1]["source"],1)
+        # After the accidental copy, native shards/index are also in the EXL3 dir.
+        exl3_mixed=entry(exl3_path,files,87,index_expected=48,index_present=48)
+        plan,_=f.build_reconcile_plan(cfg,[exl3,native],{1:[exl3_clean,source_native],2:[exl3_mixed]})
+        self.assertEqual(plan[1]["probes"][2]["state"],"missing")
+        self.assertEqual(plan[1]["probes"][2]["path"],native_path)
+        # Even with only the native subset requested, this mismatched directory
+        # is a review-only candidate, never an authoritative source/destination.
+        solo=f.classify_artifact_from_inventory(cfg,native,[exl3_mixed])
+        self.assertEqual(solo["state"],"candidate")
+
+    def test_canonical_inventory_wins_over_embedded_repository_hint(self):
+        cfg=cfg2()
+        repo="deepseek-ai/DeepSeek-V4.1-Flash"
+        canonical=f.artifact_canonical_path(cfg,{"repo":repo})
+        foreign="/home/zbig/gguf/hf/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw"
+        def record(path, n):
+            return {"path":path,"type":"directory","basename":path.rsplit('/',1)[-1],
+                "files":["config.json"],"config":{},"repo_hints":[repo],
+                "hf_commits":[],"has_config":True,"has_index":False,
+                "index_expected":0,"index_present":0,"safetensors":n,
+                "model_shards":n,"ggufs":0,"weights":n,"bytes":n}
+        art={"repo":repo,"revision":"","mode":"full","expected_shards":48}
+        probe=f.classify_artifact_from_inventory(cfg,art,[record(foreign,48),record(canonical,26)])
+        self.assertEqual(probe["state"],"partial")
+        self.assertEqual(probe["path"],canonical)
+
+    def test_job20_copies_to_canonical_not_partial_probe_path(self):
+        cfg=cfg2()
+        artifact={"kind":"huggingface","repo":"org/native","revision":"",
+                  "mode":"subset","files":["model.safetensors.index.json"],"recipes":["r"]}
+        correct=f.artifact_canonical_path(cfg,artifact)
+        wrong="/home/zbig/gguf/hf/org/other-model"
+        plan=[{"artifact":artifact,"source":1,"probes":{
+            1:{"state":"complete","path":correct},
+            2:{"state":"partial","path":wrong}}}]
+        # Deliberately patch build_reconcile_plan to emulate an outdated inventory
+        # probe: the command must still refuse to use the partial path for writing.
+        with mock.patch.object(f,"load_cfg",return_value=(cfg,None)), \
+             mock.patch.object(f,"require_storage_ready"), \
+             mock.patch.object(f,"selected_recipe_records",return_value=[(None,{"id":"r"})]), \
+             mock.patch.object(f,"ensure_recipe_sources"), \
+             mock.patch.object(f,"merge_recipe_artifacts",return_value=[artifact]), \
+             mock.patch.object(f,"build_reconcile_plan",return_value=(plan,{1:[],2:[]})), \
+             mock.patch.object(f,"print_reconcile_plan"), \
+             mock.patch.object(f,"_ensure_reconcile_tools"), \
+             mock.patch.object(f,"_ensure_canonical_alias"), \
+             mock.patch.object(f,"_sync_directory_over_fabric") as sync, \
+             mock.patch.object(f,"probe_artifact_on_node",return_value={"state":"complete","path":correct}):
+            f.cmd_model_reconcile(mock.Mock(cluster="dgx-c1",recipe="r",apply=True,
+                                           download_missing=False,seed_node=None))
+        self.assertEqual(sync.call_args.args[4],correct)
+        self.assertEqual(sync.call_args.kwargs["include_files"],artifact["files"])
+
+    def test_subset_sync_replicates_only_declared_artifact_files(self):
+        cfg=cfg2()
+        files=["config.json","model.safetensors.index.json",
+               "model-00047-of-00048.safetensors","model-00048-of-00048.safetensors"]
+        with mock.patch.object(f,"ssh",return_value=mock.Mock(returncode=0)) as ssh_mock:
+            f._sync_directory_over_fabric(cfg,1,"/models/full",2,"/models/subset",
+                                          include_files=files)
+        cmd=ssh_mock.call_args.args[2]
+        for name in files:
+            self.assertIn("--include=/"+name,cmd)
+        self.assertIn("--exclude=",cmd)
+        self.assertIn("/models/subset/",cmd)
+        self.assertNotIn("--delete",cmd)
+
+    def test_subset_sync_rejects_unsafe_file_names(self):
+        with self.assertRaises(SystemExit):
+            f._sync_directory_over_fabric(cfg2(),1,"/source",2,"/dest",
+                                          include_files=["../data"])
+
+    def test_fabric_sync_refuses_symlink_destination(self):
+        cfg=cfg2()
+        with mock.patch.object(f,"ssh",return_value=mock.Mock(returncode=0)) as ssh_mock:
+            f._sync_directory_over_fabric(cfg,1,"/models/source",2,"/models/dest")
+        cmd=ssh_mock.call_args.args[2]
+        self.assertIn("test ! -L",cmd)
+        self.assertIn("Refusing rsync into symlinked model destination",cmd)
+
     def test_hf_download_command_retries_resumable_failures(self):
         c=cfg2()
         artifact={"kind":"huggingface","repo":"org/model","revision":"","mode":"full","files":[]}

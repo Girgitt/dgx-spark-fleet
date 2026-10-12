@@ -1291,7 +1291,13 @@ def _artifact_entry_match(entry, artifact, canonical):
         score+=45; reasons.append("similar directory name")
     complete,present,expected,why=_entry_completeness(entry,artifact)
     if artifact.get("mode")=="subset" and expected and present:
-        score+=min(35,10+present*5); reasons.append(f"{present}/{expected} recipe subset files")
+        # Subset filenames (especially config.json and the safetensors index)
+        # are shared by unrelated Hugging Face checkpoints.  Even a 4/4
+        # subset match does NOT independently identify a model: otherwise a
+        # scoped V4.1 Engram reconcile flags V4 Vision as an unresolved
+        # candidate and blocks copying into V4.1's canonical directory.
+        # Require independent path/name/metadata evidence for candidate status.
+        reasons.append(f"{present}/{expected} recipe subset files (identity unverified)")
     elif int(artifact.get("expected_shards") or 0)>0:
         need=int(artifact.get("expected_shards") or 0); have=int(entry.get("model_shards") or 0)
         if have:
@@ -1308,7 +1314,11 @@ def classify_artifact_from_inventory(cfg, artifact, entries):
         m=_artifact_entry_match(entry,artifact,canonical)
         if m["score"]<=0: continue
         ranked.append((m["score"],entry,m))
-    ranked.sort(key=lambda x:(x[0],x[2]["complete_hint"],x[2]["present"]),reverse=True)
+    # A canonical on-disk target must win over hints embedded in some other
+    # checkpoint (derived/quantized models often retain the parent repo id).
+    # Keep the revision check below; canonical does not bypass identity checks.
+    ranked.sort(key=lambda x:(posixpath.normpath(str(x[1]["path"]))==canonical,
+                              x[0],x[2]["complete_hint"],x[2]["present"]),reverse=True)
     strong=[x for x in ranked if x[2]["strong"]]
     if strong:
         _,entry,m=strong[0]
@@ -1319,6 +1329,20 @@ def classify_artifact_from_inventory(cfg, artifact, entries):
         if revision and commits and revision not in commits:
             state="candidate"
             m["reasons"].append("local Hugging Face revision differs from pinned recipe")
+        # A partial tree elsewhere is not a safe HF resume/rsync target: it may
+        # be a derived model whose metadata happens to mention this repo.
+        if state=="partial" and posixpath.normpath(entry["path"]) != canonical:
+            state="candidate"
+            m["reasons"].append("partial artifact is outside its canonical destination")
+        # For subset requirements, small shared files (config and index) and
+        # embedded upstream repo IDs are common in *different* derived models.
+        # A subset in a renamed directory needs explicit operator review.
+        if (state=="complete" and artifact.get("mode")=="subset"
+                and posixpath.normpath(entry["path"]) != canonical
+                and str(entry.get("basename","")) not in (set(artifact.get("legacy_names") or [])
+                                                        | {artifact["repo"].rsplit("/",1)[-1]})):
+            state="candidate"
+            m["reasons"].append("noncanonical subset cannot establish unique model identity")
         return {"state":state,"path":entry["path"],"present":m["present"],"expected":m["expected"],
                 "score":m["score"],"reasons":m["reasons"],"bytes":entry.get("bytes",0),
                 "revision_verified":revision_verified,"entry":entry}
@@ -1345,12 +1369,28 @@ def probe_artifact_on_node(cfg, idx, artifact):
     entries=inventory_model_root_on_node(cfg,idx)
     return classify_artifact_from_inventory(cfg,artifact,entries)
 
-def _sync_directory_over_fabric(cfg, srcidx, source_path, dstidx, destination_path):
+def _sync_directory_over_fabric(cfg, srcidx, source_path, dstidx, destination_path, *, include_files=None):
     dest_host=f"{ssh_user(cfg)}@{con_name(cfg,dstidx)}"
+    # Do not allow rsync to traverse a canonical target symlink created by an
+    # older reconcile or an administrator: that would silently write elsewhere.
+    # Check both before mkdir and immediately before rsync (under our SSH mesh).
+    destination=shlex.quote(destination_path)
+    preflight=(f"test ! -L {destination} || "
+               f"{{ echo 'Refusing rsync into symlinked model destination' >&2; exit 47; }}; "
+               f"mkdir -p {destination}; test -d {destination}; test ! -L {destination}")
+    includes=""
+    if include_files is not None:
+        # Only replicate the explicitly declared subset. Without this filter,
+        # an Engram 4-file requirement copies the entire ~510 GB native model!
+        files=list(include_files)
+        if not files or any(not re.fullmatch(r"[A-Za-z0-9_.-]+",name) for name in files):
+            raise SystemExit("Unsafe/empty model artifact subset file list")
+        includes=" ".join(shlex.quote("--include=/"+name) for name in files)
+        includes += " --exclude='*'"
     remote=(
         f"set -e; ssh -o BatchMode=yes -o ConnectTimeout=7 {shlex.quote(dest_host)} "
-        f"mkdir -p {shlex.quote(destination_path)}; "
-        f"rsync -aH --partial --info=progress2 {shlex.quote(source_path.rstrip('/') + '/')} "
+        f"{shlex.quote(preflight)}; "
+        f"rsync -aH --partial --info=progress2 {includes} {shlex.quote(source_path.rstrip('/') + '/')} "
         f"{shlex.quote(dest_host + ':' + destination_path.rstrip('/') + '/')}"
     )
     print(f"\n== artifact sync node{srcidx} -> node{dstidx} over {con_name(cfg,dstidx)} ==")
@@ -1432,7 +1472,7 @@ def _refresh_reconcile_entry(entry):
 
 
 def _suppress_candidates_claimed_by_other_artifacts(cfg, plan):
-    """Do not let one positively identified artifact masquerade as another.
+    """Give each physical model directory a single canonical owner.
 
     Quantized/derived checkpoints can legitimately embed the upstream Hugging Face
     repository id in config metadata.  That hint is useful for discovering renamed
@@ -1459,7 +1499,7 @@ def _suppress_candidates_claimed_by_other_artifacts(cfg, plan):
         identity=_artifact_identity(artifact)
         canonical=artifact_canonical_path(cfg,artifact)
         for idx,probe in list(entry["probes"].items()):
-            if probe.get("state") != "candidate" or not probe.get("path"):
+            if probe.get("state") not in {"complete","partial","candidate"} or not probe.get("path"):
                 continue
             path=posixpath.normpath(probe["path"])
             owners=[x for x in claimed.get(idx,{}).get(path,[]) if x["identity"] != identity]
@@ -1652,7 +1692,7 @@ def cmd_model_reconcile(args):
                 continue
             source=_choose_download_seed(entry,args.seed_node)
             probe=entry["probes"][source]
-            target=probe.get("path") if probe.get("state")=="partial" else artifact_canonical_path(cfg,a)
+            target=artifact_canonical_path(cfg,a)
             _download_artifact_on_node(cfg,source,a,target)
             fresh=probe_artifact_on_node(cfg,source,a)
             if fresh.get("state")!="complete":
@@ -1671,8 +1711,13 @@ def cmd_model_reconcile(args):
                 unresolved=True
                 print(f"SKIP node{dst} {a['repo']}: candidate {entry['probes'][dst].get('path')} requires positive identification")
                 continue
-            destination=entry["probes"][dst].get("path") if state=="partial" else canonical
-            _sync_directory_over_fabric(cfg,source,source_path,dst,destination)
+            # Never copy into an inventory-discovered alternate path: weak
+            # embedded metadata may point at an unrelated checkpoint, and a
+            # partial subset can appear in any EXL3 folder with config/index.
+            destination=canonical
+            subset_files=a.get("files") if a.get("mode")=="subset" else None
+            _sync_directory_over_fabric(cfg,source,source_path,dst,destination,
+                                        include_files=subset_files)
             fresh=probe_artifact_on_node(cfg,dst,a)
             if fresh.get("state")!="complete":
                 raise SystemExit(f"node{dst}: artifact incomplete after sync: {a['repo']}")
